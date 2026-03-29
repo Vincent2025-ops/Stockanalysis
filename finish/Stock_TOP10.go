@@ -1,7 +1,11 @@
-//本程式作用為股票從各項技術指標中列出10支潛力股-於csv開新頁(手動)
+// 本程式作用為：爬取台股全市場收盤資料，找出前 10 名技術指標潛力股。
+// 並匯出成兩種 CSV 檔案：
+// 1. 保留歷史紀錄的檔案 (例如: Stock_TOP10_1140328_1.csv)
+// 2. 供桌面端 / GitHub Actions 讀取的固定檔名 (Stock_TOP10.csv)
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,29 +14,35 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"github.com/xuri/excelize/v2" // 安裝 excelize: go get github.com/xuri/excelize/v2
 )
 
-// StockData 定義股票資料結構
-// 包含股票代號、名稱、價格、成交量及各項技術指標
+// =====================================================================
+// 1. 資料結構定義
+// =====================================================================
 
+// StockData 定義單一檔股票的資料與其計算出的各項技術指標
 type StockData struct {
-	StockID   string  // 股票代號
-	StockName string  // 股票名稱
-	Price     float64 // 收盤價
-	Volume    int     // 成交量
-	RSI       float64 // RSI 指標
-	KD        float64 // KD 指標
-	MACD      float64 // MACD 指標
-	SMA       float64 // 移動平均線
-	Momentum  float64 // 動能指標
-	ChipRatio float64 // 籌碼集中度
-	CompanyInfo string // 公司資訊
+	StockID     string  // 股票代號 (如: 2330)
+	StockName   string  // 股票名稱 (如: 台積電)
+	Price       float64 // 今日收盤價 (若今日無交易則為最後有效收盤價)
+	PrevPrice   float64 // 昨收價 (與 Price 對應的前一個有效交易日收盤價)
+	Volume      int     // 今日成交量 (股數)
+	RSI         float64 // 相對強弱指標
+	KD          float64 // 隨機指標
+	MACD        float64 // 平滑異同移動平均線
+	SMA         float64 // 簡單移動平均線
+	Momentum    float64 // 動能指標
+	ChipRatio   float64 // 籌碼集中度估算
+	CompanyInfo string  // 公司資訊 (備用欄位)
 }
 
+// =====================================================================
+// 2. 核心爬蟲與計算邏輯
+// =====================================================================
 
-// fetchStockData 爬取台灣證交所股票資料
-func fetchStockData(previousData map[string]float64) ([]StockData, error) {
+// fetchStockData 呼叫台灣證交所 API 爬取全市場股票資料，並計算指標
+func fetchStockData() ([]StockData, error) {
+	// 1. 呼叫證交所 STOCK_DAY_ALL 取得今日所有股票收盤行情
 	resp, err := http.Get("https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json")
 	if err != nil {
 		return nil, err
@@ -44,101 +54,234 @@ func fetchStockData(previousData map[string]float64) ([]StockData, error) {
 		return nil, err
 	}
 
-	var stocks []StockData
-	if data, ok := result["data"].([]interface{}); ok {
-		for _, item := range data {
-			row := item.([]interface{})
-
-			stockID := row[0].(string)
-			stockName := row[1].(string)
-
-			// 從 previousData 取得前一日收盤價作為 fallback
-			prevClose, exists := previousData[stockID]
-			if !exists {
-				prevClose = 0 // 若無前一日數據則設為 0
-			}
-
-			// 確保收盤價有效，若無效則回退到前一日收盤價
-			price := parseFloatWithFallback(row[7], prevClose)
-			volume := parseInt(row[2])
-
-			// Debug：輸出解析結果
-			fmt.Println("✅ 股票:", stockID, "名稱:", stockName, "收盤價:", price, "成交量:", volume)
-
-			stocks = append(stocks, StockData{
-				StockID:   stockID,
-				StockName: stockName,
-				Price:     price,
-				Volume:    volume,
-			})
-		}
+	dataList, ok := result["data"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("資料格式解析錯誤")
 	}
+
+	var tempStocks []StockData
+	
+	// 2. 第一階段走訪：解析基本資料與初步昨收價
+	for _, item := range dataList {
+		row := item.([]interface{})
+		if len(row) < 10 {
+			continue // 忽略欄位不足的異常資料
+		}
+
+		stockID := fmt.Sprintf("%v", row[0])
+		stockName := fmt.Sprintf("%v", row[1])
+		volStr := strings.ReplaceAll(fmt.Sprintf("%v", row[2]), ",", "")
+		priceStr := strings.ReplaceAll(fmt.Sprintf("%v", row[7]), ",", "")
+		changeStr := fmt.Sprintf("%v", row[8]) // 漲跌價差 (STOCK_DAY_ALL 在第 8 欄)
+
+		volume, _ := strconv.Atoi(volStr)
+		price, _ := strconv.ParseFloat(priceStr, 64) // 若為 "--" 或空值，會解析為 0
+
+		// 根據今日的收盤價與漲跌價差，反推真正的「昨收價」
+		prevPrice := extractPrevPrice(price, changeStr, "")
+
+		// 📌 依照需求，保留全市場股票，不論價格高低與成交量
+		tempStocks = append(tempStocks, StockData{
+			StockID:   stockID,
+			StockName: stockName,
+			Price:     price,
+			PrevPrice: prevPrice,
+			Volume:    volume,
+		})
+	}
+
+	// 3. 確保收盤價有效：若有無效收盤價，一路往前推到有效收盤價 (並同步推算該日對應的昨收價)
+	fillMissingPrices(tempStocks)
+
+	var stocks []StockData
+	
+	// 4. 第二階段走訪：根據有效收盤價與正確對應的昨收價，計算技術指標
+	for _, stock := range tempStocks {
+		// 如果往前推了 5 天還是沒有有效價格，代表是長期停牌股或特殊證券，則略過不計算
+		if stock.Price <= 0 {
+			continue
+		}
+
+		// 確保 prevPrice 為有效值，防呆保護
+		prevPrice := stock.PrevPrice
+		if prevPrice <= 0 {
+			prevPrice = stock.Price * 0.98
+		}
+
+		// 計算技術指標
+		stock.RSI = calculateRSI(stock.Price, prevPrice)
+		stock.KD = calculateKD(stock.Price, prevPrice)
+		stock.MACD = calculateMACD(stock.Price, prevPrice)
+		stock.SMA = calculateSMA(stock.Price, prevPrice)
+		stock.Momentum = calculateMomentum(stock.Price, prevPrice)
+		stock.ChipRatio = calculateChipRatio(stock.Volume)
+		
+		stocks = append(stocks, stock)
+	}
+
 	return stocks, nil
 }
 
-// parseFloatWithFallback 解析數字，若為 `-` 則回傳 fallback 值
-func parseFloatWithFallback(value interface{}, fallback float64) float64 {
-	str, ok := value.(string)
-	if !ok || str == "-" {
-		return fallback // 當日收盤價無效時回退到前一日收盤價
-	}
-	num, err := strconv.ParseFloat(str, 64)
-	if err != nil {
-		return fallback
-	}
-	return num
-}
-
-
-// parseInt 解析數字格式的整數資料
-func parseInt(data interface{}) int {
-	str := fmt.Sprintf("%v", data)
-	str = strings.ReplaceAll(str, ",", "")
-	val, err := strconv.Atoi(str)
-	if err != nil {
-		return 0
-	}
-	return val
-}
-
-// parseFloat 解析數字格式的浮點數資料
-func parseFloat(data interface{}) float64 {
-	str := fmt.Sprintf("%v", data)
-	str = strings.ReplaceAll(str, ",", "")
-	val, err := strconv.ParseFloat(str, 64)
-	if err != nil {
-		return 0.0
-	}
-	return val
-}
-
-// computeIndicators 計算各種技術指標
-func computeIndicators(stocks []StockData) []StockData {
+// fillMissingPrices 尋找無效收盤價的股票，並透過 MI_INDEX API 一路往前推找回歷史收盤價與歷史昨收價
+func fillMissingPrices(stocks []StockData) {
+	// 將缺價格的股票放入 Map 以加速查詢，並記錄在 slice 中的索引
+	missing := make(map[string]int)
 	for i := range stocks {
-		if stocks[i].Price == 0 || stocks[i].Volume == 0 {
-			fmt.Println("❌ 技術指標計算失敗，價格或成交量為 0:", stocks[i])
+		if stocks[i].Price <= 0 {
+			missing[stocks[i].StockID] = i
+		}
+	}
+
+	if len(missing) == 0 {
+		return // 所有股票都有收盤價，無需回推
+	}
+
+	fmt.Printf("🔍 發現 %d 檔股票今日無有效收盤價，開始一路往前推尋找歷史收盤價...\n", len(missing))
+	
+	targetDate := time.Now()
+	attempts := 0
+	
+	// 最多往前推 5 個交易日 (避免無限迴圈)
+	for len(missing) > 0 && attempts < 5 {
+		targetDate = targetDate.AddDate(0, 0, -1)
+		// 跳過週末
+		if targetDate.Weekday() == time.Saturday || targetDate.Weekday() == time.Sunday {
 			continue
 		}
-		stocks[i].RSI = 100 - (100 / (1 + (stocks[i].Price / 50)))
-		stocks[i].KD = stocks[i].Price / 10
-		stocks[i].MACD = stocks[i].Price - 5
-		stocks[i].SMA = (stocks[i].Price + 10) / 2
-		stocks[i].Momentum = stocks[i].Price * 1.02
-		stocks[i].ChipRatio = float64(stocks[i].Volume) / 1000
+		
+		attempts++
+		dateStr := targetDate.Format("20060102")
+		url := fmt.Sprintf("https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date=%s&type=ALL", dateStr)
+		
+		resp, err := http.Get(url)
+		if err != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		
+		var result map[string]interface{}
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		
+		if err != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		// 解析 MI_INDEX 中的股票清單表格 (通常包含最多列的資料即為股票清單)
+		var dataList []interface{}
+		for k, v := range result {
+			if strings.HasPrefix(k, "data") {
+				if list, ok := v.([]interface{}); ok && len(list) > 500 {
+					dataList = list
+					break
+				}
+			}
+		}
+		
+		// 比對找到的歷史資料
+		if len(dataList) > 0 {
+			foundCount := 0
+			for _, item := range dataList {
+				row, ok := item.([]interface{})
+				if !ok || len(row) < 11 {
+					continue
+				}
+				
+				stockID := strings.TrimSpace(fmt.Sprintf("%v", row[0]))
+				// 檢查這檔股票是否在我們的「缺價清單」中
+				if idx, needsUpdate := missing[stockID]; needsUpdate {
+					// MI_INDEX 第 8 欄是收盤價, 第 9 欄是漲跌符號, 第 10 欄是漲跌價差
+					priceStr := strings.ReplaceAll(fmt.Sprintf("%v", row[8]), ",", "")
+					signStr := fmt.Sprintf("%v", row[9])
+					changeStr := fmt.Sprintf("%v", row[10])
+
+					if priceStr != "--" && priceStr != "" {
+						if p, err := strconv.ParseFloat(priceStr, 64); err == nil && p > 0 {
+							// 算出對應當天有效收盤價的「昨收價」
+							prevP := extractPrevPrice(p, changeStr, signStr)
+							
+							// 更新 slice 內的股價與昨收價
+							stocks[idx].Price = p
+							stocks[idx].PrevPrice = prevP
+							
+							// 從缺價清單中移除
+							delete(missing, stockID)
+							foundCount++
+						}
+					}
+				}
+			}
+			if foundCount > 0 {
+				fmt.Printf("✅ 從 %s 找回 %d 檔股票的有效收盤價與對應昨收價，剩餘 %d 檔...\n", dateStr, foundCount, len(missing))
+			}
+		}
+		
+		// ⚠️ 防擋延遲，避免被證交所封鎖 IP
+		time.Sleep(2 * time.Second) 
 	}
-	return stocks
+	
+	if len(missing) > 0 {
+		fmt.Printf("⚠️ 仍有 %d 檔股票在過去 5 個交易日內無有效收盤價 (可能為特別股或長期停牌股)。\n", len(missing))
+	}
 }
 
-// filterTopStocks 依據特定技術指標篩選出前 10 名的股票
-func filterTopStocks(stocks []StockData, key string) []StockData {
+// extractPrevPrice 根據收盤價與漲跌價差，反推昨收價
+// 公式：昨收價 = 收盤價 - 漲跌金額 (考量正負號)
+func extractPrevPrice(price float64, changeStr string, signStr string) float64 {
+	if changeStr == "" || changeStr == "--" || price == 0 {
+		return price
+	}
+
+	// 萃取純數字部分
+	var numericPart string
+	for _, char := range changeStr {
+		if (char >= '0' && char <= '9') || char == '.' {
+			numericPart += string(char)
+		}
+	}
+	
+	if numericPart == "" {
+		return price
+	}
+
+	change, _ := strconv.ParseFloat(numericPart, 64)
+
+	// 判斷正負號 (處理 STOCK_DAY_ALL 的內含負號，與 MI_INDEX 的獨立符號或顏色字串)
+	isNegative := strings.Contains(changeStr, "-") || strings.Contains(signStr, "-") || strings.Contains(signStr, "綠")
+	
+	if isNegative {
+		change = -change
+	}
+
+	// 昨收價 = 今日收盤價 - 漲跌價差
+	return price - change
+}
+
+// ---------------------------------------------------------------------
+// 以下為簡化版的技術指標模擬算法
+// ---------------------------------------------------------------------
+func calculateRSI(current, prev float64) float64      { return 100 - (100 / (1 + (current / prev))) }
+func calculateKD(current, prev float64) float64       { return (current - prev) / prev * 100 }
+func calculateMACD(current, prev float64) float64     { return current - prev }
+func calculateSMA(current, prev float64) float64      { return (current + prev) / 2 }
+func calculateMomentum(current, prev float64) float64 { return (current / prev) * 100 }
+func calculateChipRatio(volume int) float64           { return float64(volume) / 100000.0 }
+
+// =====================================================================
+// 3. 排序與匯出邏輯
+// =====================================================================
+
+// getTop10 根據指定的技術指標，對股票陣列進行排序，並回傳前 10 名
+func getTop10(stocks []StockData, indicator string) []StockData {
 	sort.Slice(stocks, func(i, j int) bool {
-		switch key {
+		switch indicator {
 		case "RSI":
-			return stocks[i].RSI < 30 && stocks[i].RSI < stocks[j].RSI
+			return stocks[i].RSI < stocks[j].RSI
 		case "KD":
-			return stocks[i].KD > 80 && stocks[i].KD > stocks[j].KD
+			return stocks[i].KD > stocks[j].KD
 		case "MACD":
-			return stocks[i].MACD > 0 && stocks[i].MACD > stocks[j].MACD
+			return stocks[i].MACD > stocks[j].MACD
 		case "SMA":
 			return stocks[i].SMA > stocks[j].SMA
 		case "Momentum":
@@ -148,128 +291,117 @@ func filterTopStocks(stocks []StockData, key string) []StockData {
 		}
 		return false
 	})
+
 	if len(stocks) > 10 {
 		return stocks[:10]
 	}
 	return stocks
 }
 
-// exportToExcel 匯出數據到 Excel，為每次執行新增新分頁（民國年月日格式）
-func exportToExcel(stocks map[string][]StockData) error {
-	fileName := "Stock_TOP10.xlsx"
-
-	// 取得當前年份，轉換為民國年
-	year, month, day := time.Now().Date()
-	minguoYear := year - 1911 // 轉換為民國年
-	timeFormat := fmt.Sprintf("%03d%02d%02d", minguoYear, int(month), int(day)) // 1140303
-
-	// 嘗試開啟現有 Excel 檔案，若不存在則創建新檔案
-	var file *excelize.File
-	if _, err := os.Stat(fileName); os.IsNotExist(err) {
-		file = excelize.NewFile() // 新建 Excel
-	} else {
-		file, err = excelize.OpenFile(fileName)
-		if err != nil {
-			return fmt.Errorf("❌ 無法開啟 Excel 檔案: %v", err)
-		}
-	}
-
-	// 檢查是否已存在相同名稱的工作表，避免覆蓋
-	sheetName := timeFormat
-	counter := 1
-	for {
-		index, err := file.GetSheetIndex(sheetName)
-		if err != nil || index == -1 {
-			break // 如果分頁不存在或發生錯誤，就停止迴圈
-		}
-			sheetName = fmt.Sprintf("%s_%d", timeFormat, counter)
-			counter++
-	}
-
-	// 新增工作表
-	index, err := file.NewSheet(sheetName)
+// exportToCSV 將彙整好的 Top10 清單匯出成 CSV 檔案
+func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
+	file, err := os.Create(fileName)
 	if err != nil {
-		return fmt.Errorf("❌ 無法新增工作表: %v", err)
+		return fmt.Errorf("❌ 無法建立 CSV: %v", err)
 	}
+	defer file.Close()
 
-	// 設定標題行
-	headers := []string{"技術指標", "股票代號", "名稱", "價格", "成交量", "指標值", "說明"}
-	for col, header := range headers {
-		cell := fmt.Sprintf("%s1", string(rune('A'+col))) // A1, B1, C1...
-		file.SetCellValue(sheetName, cell, header)
-	}
+	// 📌 寫入 UTF-8 BOM
+	file.WriteString("\xEF\xBB\xBF")
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
 
-	// 寫入股票數據
-	rowNum := 2 // 從第 2 列開始寫入
-	for key, list := range stocks {
-		for _, stock := range list {
-			description := ""
-			switch key {
+	writer.Write([]string{"技術指標", "股票代號", "名稱", "價格", "成交量", "指標值", "說明"})
+	order := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "ChipRatio"}
+
+	for _, indicator := range order {
+		stocks, ok := allTop10[indicator]
+		if !ok {
+			continue 
+		}
+
+		for _, stock := range stocks {
+			var valueStr string
+			var desc string
+
+			switch indicator {
 			case "RSI":
-				description = "RSI 低於 30，可能即將反彈"
+				valueStr = fmt.Sprintf("%.2f", stock.RSI)
+				desc = "RSI 低於 30，可能即將反彈"
 			case "KD":
-				description = "KD 指標大於 80，可能形成黃金交叉"
+				valueStr = fmt.Sprintf("%.2f", stock.KD)
+				desc = "KD 指標大於 80，可能形成黃金交叉"
 			case "MACD":
-				description = "MACD 大於 0，可能進入上升趨勢"
+				valueStr = fmt.Sprintf("%.2f", stock.MACD)
+				desc = "MACD 大於 0，可能進入上升趨勢"
 			case "SMA":
-				description = "SMA 簡單移動平均線持續上升，顯示多頭趨勢"
+				valueStr = fmt.Sprintf("%.2f", stock.SMA)
+				desc = "均線持續上升，顯示多頭趨勢"
 			case "Momentum":
-				description = "動能指標上升，顯示市場買氣強勁"
+				valueStr = fmt.Sprintf("%.2f", stock.Momentum)
+				desc = "動能指標上升，顯示市場買氣強勁"
 			case "ChipRatio":
-				description = "籌碼集中度提升，顯示主力介入"
+				valueStr = fmt.Sprintf("%.2f", stock.ChipRatio)
+				desc = "籌碼集中度提升，顯示主力介入"
 			}
 
-			// 寫入數據
-			file.SetCellValue(sheetName, fmt.Sprintf("A%d", rowNum), key)
-			file.SetCellValue(sheetName, fmt.Sprintf("B%d", rowNum), stock.StockID)
-			file.SetCellValue(sheetName, fmt.Sprintf("C%d", rowNum), stock.StockName)
-			file.SetCellValue(sheetName, fmt.Sprintf("D%d", rowNum), stock.Price)
-			file.SetCellValue(sheetName, fmt.Sprintf("E%d", rowNum), stock.Volume)
-			file.SetCellValue(sheetName, fmt.Sprintf("F%d", rowNum), stock.RSI)
-			file.SetCellValue(sheetName, fmt.Sprintf("G%d", rowNum), description)
-			rowNum++
+			writer.Write([]string{
+				indicator,
+				stock.StockID,
+				stock.StockName,
+				fmt.Sprintf("%.2f", stock.Price), 
+				strconv.Itoa(stock.Volume),       
+				valueStr,
+				desc,
+			})
 		}
 	}
 
-	// 設定預設顯示的分頁
-	file.SetActiveSheet(index)
-
-	// 儲存 Excel 檔案
-	if err := file.SaveAs(fileName); err != nil {
-		return fmt.Errorf("❌ 無法儲存 Excel: %v", err)
-	}
-
-	fmt.Println("✅ Excel 匯出成功！新增分頁:", sheetName)
+	fmt.Println("✅ CSV 匯出成功！檔名:", fileName)
 	return nil
 }
 
-// main 主執行函式
+// =====================================================================
+// 4. 主執行函式 (程式進入點)
+// =====================================================================
 func main() {
-	// 模擬前一日的收盤價資料
-	previousData := map[string]float64{
-		"2330": 650.5, // 假設台積電昨天的收盤價為 650.5
-		"2317": 150.0, // 假設鴻海昨天的收盤價為 150.0
-	}
-
-	stocks, err := fetchStockData(previousData)
+	fmt.Println("開始抓取台股資料...")
+	
+	// 呼叫抓取與計算邏輯 (不需要寫死的 previousData Map 了！)
+	stocks, err := fetchStockData()
 	if err != nil {
-		fmt.Println("無法取得股價數據:", err)
+		fmt.Println("❌ 抓取資料失敗:", err)
 		return
 	}
 
-	stocks = computeIndicators(stocks)
-	filteredStocks := map[string][]StockData{
-		"RSI":       filterTopStocks(stocks, "RSI"),
-		"KD":        filterTopStocks(stocks, "KD"),
-		"MACD":      filterTopStocks(stocks, "MACD"),
-		"SMA":       filterTopStocks(stocks, "SMA"),
-		"Momentum":  filterTopStocks(stocks, "Momentum"),
-		"ChipRatio": filterTopStocks(stocks, "ChipRatio"),
+	indicators := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "ChipRatio"}
+	allTop10 := make(map[string][]StockData)
+
+	for _, ind := range indicators {
+		stocksCopy := make([]StockData, len(stocks))
+		copy(stocksCopy, stocks)
+		
+		top10 := getTop10(stocksCopy, ind)
+		allTop10[ind] = top10
 	}
 
-	if err := exportToExcel(filteredStocks); err != nil {
-		fmt.Println("Excel 匯出錯誤:", err)
-	} else {
-		fmt.Println("✅ Excel 匯出成功！")
+	now := time.Now()
+	minguoYear := now.Year() - 1911
+	dateStr := fmt.Sprintf("%d%02d%02d", minguoYear, now.Month(), now.Day())
+	
+	fileName := fmt.Sprintf("Stock_TOP10_%s.csv", dateStr)
+	counter := 1
+	for {
+		if _, err := os.Stat(fileName); os.IsNotExist(err) {
+			break
+		}
+		fileName = fmt.Sprintf("Stock_TOP10_%s_%d.csv", dateStr, counter)
+		counter++
 	}
+
+	// 匯出 1：帶有日期的歷史檔案
+	exportToCSV(fileName, allTop10)
+
+	// 匯出 2：供桌面軟體同步用的最新版
+	exportToCSV("Stock_TOP10.csv", allTop10)
 }
