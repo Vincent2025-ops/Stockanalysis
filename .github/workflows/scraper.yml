@@ -1,39 +1,36 @@
-# .github/workflows/scraper.yml
 name: Daily Taiwan Stock Scraper
 
 on:
   schedule:
-    # 使用 UTC 時間。台灣時間(UTC+8)下午 15:30 = UTC 早上 07:30
-    # 設定為每週一到週五的 07:30 UTC 執行
+    # 台灣時間(UTC+8)下午 15:30 = UTC 07:30 (週一至週五)
     - cron: '30 7 * * 1-5'
-  workflow_dispatch: # 允許你隨時在網頁上手動點擊執行
+  workflow_dispatch: # 允許手動觸發測試
 
 jobs:
   build-and-scrape:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: 📥 取得程式碼
         uses: actions/checkout@v3
 
-      - name: Setup Go Environment
+      - name: ⚙️ 設定 Go 環境
         uses: actions/setup-go@v4
         with:
-          go-version: '1.21' # 設定你的 Go 版本
+          go-version: '1.21'
 
-      - name: Run Scraper (執行你的爬蟲程式)
-        # ⚠️ 重要：指定工作目錄為你的程式放置位置
-        working-directory: ./Stockanalysis/finish
+      - name: 🚀 執行爬蟲程式
+        # ⚠️ 修正點 1：直接進入 finish 資料夾即可
+        working-directory: ./finish
         run: |
           go mod init quant-data || true
-          go get [github.com/xuri/excelize/v2](https://github.com/xuri/excelize/v2)
           go mod tidy
           go run Stock_TOP10.go
 
-      - name: Commit and Push CSV back to Repo
+      - name: 💾 將產生的 CSV 存回 GitHub
         run: |
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
-          # ⚠️ 重要：指定將該目錄下產生的 csv 檔加入版本控制
-          git add Stockanalysis/finish/*.csv
-          git commit -m "🤖 自動更新: 台股每日收盤資料 [skip ci]" || exit 0
+          # ⚠️ 修正點 2：路徑改為 finish/*.csv
+          git add finish/*.csv
+          git commit -m "🤖 自動更新: 台股每日 TOP10 潛力股資料 [skip ci]" || exit 0
           git push
