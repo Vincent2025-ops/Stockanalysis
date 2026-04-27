@@ -12,6 +12,8 @@ jobs:
     steps:
       - name: 📥 取得程式碼
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # 🌟 關鍵修正：抓取完整的 Git 歷史紀錄，確保後續 rebase 不會報錯
 
       - name: ⚙️ 設定 Go 環境
         uses: actions/setup-go@v4
