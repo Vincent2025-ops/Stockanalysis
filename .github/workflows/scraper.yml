@@ -17,8 +17,8 @@ jobs:
       - name: 📥 取得程式碼
         uses: actions/checkout@v4
         with:
-          ref: main         # 🌟 關鍵修正 1：明確指定抓取 main 分支
-          fetch-depth: 0    # 🌟 關鍵修正 2：抓取完整歷史紀錄
+          ref: main         # 明確指定抓取 main 分支
+          fetch-depth: 0    # 抓取完整歷史紀錄
 
       - name: ⚙️ 設定 Go 環境
         uses: actions/setup-go@v5
@@ -26,7 +26,6 @@ jobs:
           go-version: '1.21'
 
       - name: 🚀 執行爬蟲程式
-        # ⚠️ 修正點 1：直接進入 finish 資料夾即可
         working-directory: ./finish
         run: |
           go mod init quant-data || true
@@ -38,23 +37,36 @@ jobs:
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
           
-          # 🌟 關鍵修正 3：強制切換並確保我們在 main 分支上操作
+          # 強制切換並確保我們在 main 分支上操作
           git checkout main
-          
           git add .
           
-          # 判斷是否有檔案變更，有變更才 commit，避免回傳錯誤碼導致中斷
+          # 判斷是否有檔案變更，有變更才 commit
           if ! git diff-index --quiet HEAD; then
             git commit -m "🤖 自動更新: 台股每日 TOP10 潛力股資料 [skip ci]"
+            
+            echo "=== 開始同步並推播 ==="
+            # 🌟 關鍵終極修正：加入 5 次 Retry 機制，徹底消滅 Git 推播衝突
+            for i in {1..5}; do
+              echo "嘗試推播 (第 $i 次)..."
+              
+              # 拉取遠端最新進度並疊加
+              git fetch origin main
+              git pull --rebase origin main
+              
+              # 嘗試推播
+              if git push origin main; then
+                echo "✅ 推播成功！"
+                exit 0
+              fi
+              
+              echo "⚠️ 推播遇到衝突，等待 10 秒後自動重試..."
+              sleep 10
+            done
+            
+            echo "❌ 重試 5 次皆失敗，請檢查 Git 設定。"
+            exit 1
           else
-            echo "沒有新資料需要更新"
+            echo "✅ 沒有新資料需要更新"
             exit 0
           fi
-          
-          # 🌟 關鍵修正 4：強制拉取遠端最新進度並合併
-          echo "=== 抓取遠端最新狀態 ==="
-          git fetch origin main
-          git pull --rebase origin main
-          
-          echo "=== 推播回 GitHub ==="
-          git push origin main
