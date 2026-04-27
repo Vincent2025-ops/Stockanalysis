@@ -26,11 +26,13 @@ jobs:
           go mod tidy
           go run Stock_TOP10.go
 
-      - name: 💾 將產生的 CSV 存回 GitHub
+      - name: 將產生的 CSV 存回 GitHub
         run: |
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
-          # ⚠️ 修正點 2：路徑改為 finish/*.csv
-          git add finish/*.csv
-          git commit -m "🤖 自動更新: 台股每日 TOP10 潛力股資料 [skip ci]" || exit 0
+          git add .
+          git commit -m "🤖 自動更新: 台股每日 TOP10 潛力股資料 [skip ci]" || echo "No changes to commit"
+          # ▼ 新增這行：在上傳前，先同步 GitHub 上最新的進度，並將我們的 commit 疊加在最新進度之上
+          git pull --rebase origin main
+          # ▼ 原本的上傳指令
           git push
