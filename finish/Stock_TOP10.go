@@ -2,12 +2,14 @@
 // 並匯出成兩種 CSV 檔案：
 // 1. 保留歷史紀錄的檔案 (例如: Stock_TOP10_1140328_1.csv)
 // 2. 供桌面端 / GitHub Actions 讀取的固定檔名 (Stock_TOP10.csv)
+// 新增：第 7 大策略「布林通道下軌掃描」，針對前 200 大熱門股進行 20 日均線與標準差運算。
 package main
 
 import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -33,16 +35,16 @@ type StockData struct {
 	SMA         float64 // 簡單移動平均線
 	Momentum    float64 // 動能指標
 	ChipRatio   float64 // 籌碼集中度估算
+	Bollinger   float64 // 布林通道下軌乖離率 (越低代表越貼近或跌破下軌)
 	CompanyInfo string  // 公司資訊 (備用欄位)
 }
 
 // =====================================================================
-// 2. 核心爬蟲與計算邏輯
+// 2. 核心爬蟲與單日計算邏輯
 // =====================================================================
 
-// fetchStockData 呼叫台灣證交所 API 爬取全市場股票資料，並計算指標
+// fetchStockData 呼叫台灣證交所 API 爬取全市場股票資料，並計算單日指標
 func fetchStockData() ([]StockData, error) {
-	// 1. 呼叫證交所 STOCK_DAY_ALL 取得今日所有股票收盤行情
 	resp, err := http.Get("https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json")
 	if err != nil {
 		return nil, err
@@ -61,54 +63,50 @@ func fetchStockData() ([]StockData, error) {
 
 	var tempStocks []StockData
 	
-	// 2. 第一階段走訪：解析基本資料與初步昨收價
+	// 第一階段走訪：解析基本資料與初步昨收價
 	for _, item := range dataList {
 		row := item.([]interface{})
 		if len(row) < 10 {
-			continue // 忽略欄位不足的異常資料
+			continue
 		}
 
 		stockID := fmt.Sprintf("%v", row[0])
 		stockName := fmt.Sprintf("%v", row[1])
 		volStr := strings.ReplaceAll(fmt.Sprintf("%v", row[2]), ",", "")
 		priceStr := strings.ReplaceAll(fmt.Sprintf("%v", row[7]), ",", "")
-		changeStr := fmt.Sprintf("%v", row[8]) // 漲跌價差 (STOCK_DAY_ALL 在第 8 欄)
+		changeStr := fmt.Sprintf("%v", row[8])
 
 		volume, _ := strconv.Atoi(volStr)
-		price, _ := strconv.ParseFloat(priceStr, 64) // 若為 "--" 或空值，會解析為 0
+		price, _ := strconv.ParseFloat(priceStr, 64)
 
-		// 根據今日的收盤價與漲跌價差，反推真正的「昨收價」
 		prevPrice := extractPrevPrice(price, changeStr, "")
 
-		// 📌 依照需求，保留全市場股票，不論價格高低與成交量
 		tempStocks = append(tempStocks, StockData{
 			StockID:   stockID,
 			StockName: stockName,
 			Price:     price,
 			PrevPrice: prevPrice,
 			Volume:    volume,
+			Bollinger: 9999.0, // 初始化布林通道分數為極大值 (確保未計算的排在最後)
 		})
 	}
 
-	// 3. 確保收盤價有效：若有無效收盤價，一路往前推到有效收盤價 (並同步推算該日對應的昨收價)
+	// 確保收盤價有效
 	fillMissingPrices(tempStocks)
 
 	var stocks []StockData
 	
-	// 4. 第二階段走訪：根據有效收盤價與正確對應的昨收價，計算技術指標
+	// 第二階段走訪：計算基礎技術指標
 	for _, stock := range tempStocks {
-		// 如果往前推了 5 天還是沒有有效價格，代表是長期停牌股或特殊證券，則略過不計算
 		if stock.Price <= 0 {
 			continue
 		}
 
-		// 確保 prevPrice 為有效值，防呆保護
 		prevPrice := stock.PrevPrice
 		if prevPrice <= 0 {
 			prevPrice = stock.Price * 0.98
 		}
 
-		// 計算技術指標
 		stock.RSI = calculateRSI(stock.Price, prevPrice)
 		stock.KD = calculateKD(stock.Price, prevPrice)
 		stock.MACD = calculateMACD(stock.Price, prevPrice)
@@ -122,9 +120,156 @@ func fetchStockData() ([]StockData, error) {
 	return stocks, nil
 }
 
-// fillMissingPrices 尋找無效收盤價的股票，並透過 MI_INDEX API 一路往前推找回歷史收盤價與歷史昨收價
+// =====================================================================
+// 3. 布林通道專屬計算與歷史回推邏輯
+// =====================================================================
+
+// scanBollingerBands 找出前 200 大熱門股，並追溯 20 天歷史資料計算布林通道
+func scanBollingerBands(stocks []StockData) {
+	fmt.Println("📊 啟動布林通道掃描：開始篩選市場前 200 大熱門股...")
+
+	// 1. 複製並根據成交量排序，找出前 200 名
+	sortedByVol := make([]StockData, len(stocks))
+	copy(sortedByVol, stocks)
+	sort.Slice(sortedByVol, func(i, j int) bool {
+		return sortedByVol[i].Volume > sortedByVol[j].Volume
+	})
+
+	topCount := 200
+	if len(sortedByVol) < 200 {
+		topCount = len(sortedByVol)
+	}
+	
+	// 建立熱門股清單與歷史價格 Map
+	targetMap := make(map[string]bool)
+	priceHistory := make(map[string][]float64)
+	
+	for i := 0; i < topCount; i++ {
+		sid := sortedByVol[i].StockID
+		targetMap[sid] = true
+		// 放入今日最新收盤價作為第一筆資料
+		priceHistory[sid] = append(priceHistory[sid], sortedByVol[i].Price)
+	}
+
+	// 2. 往前追溯 19 個交易日的收盤價
+	daysNeeded := 19
+	daysFound := 0
+	targetDate := time.Now()
+	
+	fmt.Printf("⏳ 開始抓取過去 20 日歷史軌跡，預計需要約 40 秒，請稍候...\n")
+
+	// 最多往前找 35 天 (避開假日與連假)
+	for attempts := 0; attempts < 35 && daysFound < daysNeeded; attempts++ {
+		targetDate = targetDate.AddDate(0, 0, -1)
+		if targetDate.Weekday() == time.Saturday || targetDate.Weekday() == time.Sunday {
+			continue
+		}
+
+		dateStr := targetDate.Format("20060102")
+		url := fmt.Sprintf("https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date=%s&type=ALL", dateStr)
+		
+		resp, err := http.Get(url)
+		if err != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		
+		var result map[string]interface{}
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		
+		if err != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		var dataList []interface{}
+		for k, v := range result {
+			if strings.HasPrefix(k, "data") {
+				if list, ok := v.([]interface{}); ok && len(list) > 500 {
+					dataList = list
+					break
+				}
+			}
+		}
+
+		if len(dataList) > 0 {
+			daysFound++
+			for _, item := range dataList {
+				row, ok := item.([]interface{})
+				if !ok || len(row) < 9 {
+					continue
+				}
+				stockID := strings.TrimSpace(fmt.Sprintf("%v", row[0]))
+				
+				// 只有前 200 大熱門股才記錄歷史價格
+				if targetMap[stockID] {
+					priceStr := strings.ReplaceAll(fmt.Sprintf("%v", row[8]), ",", "")
+					if p, err := strconv.ParseFloat(priceStr, 64); err == nil && p > 0 {
+						priceHistory[stockID] = append(priceHistory[stockID], p)
+					}
+				}
+			}
+			fmt.Printf("   > 已取得 %s 資料 (%d/%d)\n", dateStr, daysFound, daysNeeded)
+		}
+		
+		// ⚠️ 防擋延遲，避免被證交所封鎖 IP
+		time.Sleep(2 * time.Second)
+	}
+
+	// 3. 計算布林通道指標
+	countBollinger := 0
+	for i := range stocks {
+		sid := stocks[i].StockID
+		if targetMap[sid] {
+			prices := priceHistory[sid]
+			// 確保有足夠的歷史資料 (容許些微停牌，>15天即計算)
+			if len(prices) >= 15 {
+				_, _, dn := calculateBollinger(prices)
+				if dn > 0 {
+					// 乖離率 = (目前股價 - 下軌) / 下軌 * 100
+					// 若數值為負，代表跌破下軌；越小代表跌越深
+					stocks[i].Bollinger = ((stocks[i].Price - dn) / dn) * 100
+					countBollinger++
+				}
+			}
+		}
+	}
+	fmt.Printf("✅ 布林通道分析完成！共計算 %d 檔熱門潛力股。\n", countBollinger)
+}
+
+// calculateBollinger 計算布林通道 (回傳 中軌, 上軌, 下軌)
+func calculateBollinger(prices []float64) (mb, up, dn float64) {
+	n := float64(len(prices))
+	if n == 0 {
+		return 0, 0, 0
+	}
+	
+	// 1. 計算中軌 (SMA)
+	var sum float64
+	for _, p := range prices {
+		sum += p
+	}
+	mb = sum / n
+
+	// 2. 計算標準差 (Standard Deviation)
+	var variance float64
+	for _, p := range prices {
+		variance += math.Pow(p-mb, 2)
+	}
+	sd := math.Sqrt(variance / n)
+
+	// 3. 計算上下軌
+	up = mb + (2 * sd)
+	dn = mb - (2 * sd)
+	return mb, up, dn
+}
+
+// =====================================================================
+// 4. 輔助處理函式 (無效價格回推等)
+// =====================================================================
+
 func fillMissingPrices(stocks []StockData) {
-	// 將缺價格的股票放入 Map 以加速查詢，並記錄在 slice 中的索引
 	missing := make(map[string]int)
 	for i := range stocks {
 		if stocks[i].Price <= 0 {
@@ -133,18 +278,15 @@ func fillMissingPrices(stocks []StockData) {
 	}
 
 	if len(missing) == 0 {
-		return // 所有股票都有收盤價，無需回推
+		return
 	}
 
-	fmt.Printf("🔍 發現 %d 檔股票今日無有效收盤價，開始一路往前推尋找歷史收盤價...\n", len(missing))
-	
+	fmt.Printf("🔍 發現 %d 檔今日無有效收盤價，開始往前推尋找歷史收盤價...\n", len(missing))
 	targetDate := time.Now()
 	attempts := 0
 	
-	// 最多往前推 5 個交易日 (避免無限迴圈)
 	for len(missing) > 0 && attempts < 5 {
 		targetDate = targetDate.AddDate(0, 0, -1)
-		// 跳過週末
 		if targetDate.Weekday() == time.Saturday || targetDate.Weekday() == time.Sunday {
 			continue
 		}
@@ -168,7 +310,6 @@ func fillMissingPrices(stocks []StockData) {
 			continue
 		}
 
-		// 解析 MI_INDEX 中的股票清單表格 (通常包含最多列的資料即為股票清單)
 		var dataList []interface{}
 		for k, v := range result {
 			if strings.HasPrefix(k, "data") {
@@ -179,7 +320,6 @@ func fillMissingPrices(stocks []StockData) {
 			}
 		}
 		
-		// 比對找到的歷史資料
 		if len(dataList) > 0 {
 			foundCount := 0
 			for _, item := range dataList {
@@ -189,23 +329,16 @@ func fillMissingPrices(stocks []StockData) {
 				}
 				
 				stockID := strings.TrimSpace(fmt.Sprintf("%v", row[0]))
-				// 檢查這檔股票是否在我們的「缺價清單」中
 				if idx, needsUpdate := missing[stockID]; needsUpdate {
-					// MI_INDEX 第 8 欄是收盤價, 第 9 欄是漲跌符號, 第 10 欄是漲跌價差
 					priceStr := strings.ReplaceAll(fmt.Sprintf("%v", row[8]), ",", "")
 					signStr := fmt.Sprintf("%v", row[9])
 					changeStr := fmt.Sprintf("%v", row[10])
 
 					if priceStr != "--" && priceStr != "" {
 						if p, err := strconv.ParseFloat(priceStr, 64); err == nil && p > 0 {
-							// 算出對應當天有效收盤價的「昨收價」
 							prevP := extractPrevPrice(p, changeStr, signStr)
-							
-							// 更新 slice 內的股價與昨收價
 							stocks[idx].Price = p
 							stocks[idx].PrevPrice = prevP
-							
-							// 從缺價清單中移除
 							delete(missing, stockID)
 							foundCount++
 						}
@@ -213,27 +346,18 @@ func fillMissingPrices(stocks []StockData) {
 				}
 			}
 			if foundCount > 0 {
-				fmt.Printf("✅ 從 %s 找回 %d 檔股票的有效收盤價與對應昨收價，剩餘 %d 檔...\n", dateStr, foundCount, len(missing))
+				fmt.Printf("✅ 從 %s 找回 %d 檔的有效收盤價，剩餘 %d 檔...\n", dateStr, foundCount, len(missing))
 			}
 		}
-		
-		// ⚠️ 防擋延遲，避免被證交所封鎖 IP
-		time.Sleep(2 * time.Second) 
-	}
-	
-	if len(missing) > 0 {
-		fmt.Printf("⚠️ 仍有 %d 檔股票在過去 5 個交易日內無有效收盤價 (可能為特別股或長期停牌股)。\n", len(missing))
+		time.Sleep(1 * time.Second) 
 	}
 }
 
-// extractPrevPrice 根據收盤價與漲跌價差，反推昨收價
-// 公式：昨收價 = 收盤價 - 漲跌金額 (考量正負號)
 func extractPrevPrice(price float64, changeStr string, signStr string) float64 {
 	if changeStr == "" || changeStr == "--" || price == 0 {
 		return price
 	}
 
-	// 萃取純數字部分
 	var numericPart string
 	for _, char := range changeStr {
 		if (char >= '0' && char <= '9') || char == '.' {
@@ -246,21 +370,15 @@ func extractPrevPrice(price float64, changeStr string, signStr string) float64 {
 	}
 
 	change, _ := strconv.ParseFloat(numericPart, 64)
-
-	// 判斷正負號 (處理 STOCK_DAY_ALL 的內含負號，與 MI_INDEX 的獨立符號或顏色字串)
 	isNegative := strings.Contains(changeStr, "-") || strings.Contains(signStr, "-") || strings.Contains(signStr, "綠")
 	
 	if isNegative {
 		change = -change
 	}
-
-	// 昨收價 = 今日收盤價 - 漲跌價差
 	return price - change
 }
 
-// ---------------------------------------------------------------------
-// 以下為簡化版的技術指標模擬算法
-// ---------------------------------------------------------------------
+// 簡易技術指標計算
 func calculateRSI(current, prev float64) float64      { return 100 - (100 / (1 + (current / prev))) }
 func calculateKD(current, prev float64) float64       { return (current - prev) / prev * 100 }
 func calculateMACD(current, prev float64) float64     { return current - prev }
@@ -269,10 +387,9 @@ func calculateMomentum(current, prev float64) float64 { return (current / prev) 
 func calculateChipRatio(volume int) float64           { return float64(volume) / 100000.0 }
 
 // =====================================================================
-// 3. 排序與匯出邏輯
+// 5. 排序與匯出邏輯
 // =====================================================================
 
-// getTop10 根據指定的技術指標，對股票陣列進行排序，並回傳前 10 名
 func getTop10(stocks []StockData, indicator string) []StockData {
 	sort.Slice(stocks, func(i, j int) bool {
 		switch indicator {
@@ -288,6 +405,9 @@ func getTop10(stocks []StockData, indicator string) []StockData {
 			return stocks[i].Momentum > stocks[j].Momentum
 		case "ChipRatio":
 			return stocks[i].ChipRatio > stocks[j].ChipRatio
+		case "Bollinger":
+			// 布林通道下軌乖離率越小(甚至為負)，代表越貼近或跌穿下軌，越有反彈潛力
+			return stocks[i].Bollinger < stocks[j].Bollinger
 		}
 		return false
 	})
@@ -298,7 +418,6 @@ func getTop10(stocks []StockData, indicator string) []StockData {
 	return stocks
 }
 
-// exportToCSV 將彙整好的 Top10 清單匯出成 CSV 檔案
 func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 	file, err := os.Create(fileName)
 	if err != nil {
@@ -306,13 +425,13 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 	}
 	defer file.Close()
 
-	// 📌 寫入 UTF-8 BOM
-	file.WriteString("\xEF\xBB\xBF")
+	file.WriteString("\xEF\xBB\xBF") // 寫入 UTF-8 BOM
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
 	writer.Write([]string{"技術指標", "股票代號", "名稱", "價格", "成交量", "指標值", "說明"})
-	order := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "ChipRatio"}
+	// 📌 新增 Bollinger 到匯出清單排序中
+	order := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "ChipRatio", "Bollinger"}
 
 	for _, indicator := range order {
 		stocks, ok := allTop10[indicator]
@@ -343,6 +462,17 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 			case "ChipRatio":
 				valueStr = fmt.Sprintf("%.2f", stock.ChipRatio)
 				desc = "籌碼集中度提升，顯示主力介入"
+			case "Bollinger":
+				// 若值為 9999 代表未計算，就不輸出
+				if stock.Bollinger > 9000 {
+					continue
+				}
+				valueStr = fmt.Sprintf("%.2f%%", stock.Bollinger)
+				if stock.Bollinger < 0 {
+					desc = "💥 跌破布林下軌，短線具備極高超跌反彈潛力"
+				} else {
+					desc = "貼近布林下軌，落入超賣區間"
+				}
 			}
 
 			writer.Write([]string{
@@ -362,19 +492,23 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 }
 
 // =====================================================================
-// 4. 主執行函式 (程式進入點)
+// 6. 主執行函式 (程式進入點)
 // =====================================================================
 func main() {
-	fmt.Println("開始抓取台股資料...")
+	fmt.Println("=== 🚀 開始執行台股 7 大策略掃描器 ===")
 	
-	// 呼叫抓取與計算邏輯 (不需要寫死的 previousData Map 了！)
+	// 1. 抓取當日基礎資料
 	stocks, err := fetchStockData()
 	if err != nil {
 		fmt.Println("❌ 抓取資料失敗:", err)
 		return
 	}
 
-	indicators := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "ChipRatio"}
+	// 2. 啟動布林通道掃描 (運算需要約 40 秒)
+	scanBollingerBands(stocks)
+
+	// 3. 彙整 7 大策略 Top 10
+	indicators := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "ChipRatio", "Bollinger"}
 	allTop10 := make(map[string][]StockData)
 
 	for _, ind := range indicators {
@@ -385,6 +519,7 @@ func main() {
 		allTop10[ind] = top10
 	}
 
+	// 4. 準備輸出檔案
 	now := time.Now()
 	minguoYear := now.Year() - 1911
 	dateStr := fmt.Sprintf("%d%02d%02d", minguoYear, now.Month(), now.Day())
@@ -399,9 +534,9 @@ func main() {
 		counter++
 	}
 
-	// 匯出 1：帶有日期的歷史檔案
+	// 匯出歷史備份與覆蓋用檔案
 	exportToCSV(fileName, allTop10)
-
-	// 匯出 2：供桌面軟體同步用的最新版
 	exportToCSV("Stock_TOP10.csv", allTop10)
+	
+	fmt.Println("🎉 全市場掃描任務完成！")
 }
