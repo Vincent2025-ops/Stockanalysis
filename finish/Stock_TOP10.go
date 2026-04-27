@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"net/http"
 	"os"
 	"sort"
@@ -156,7 +157,7 @@ func scanBollingerBands(stocks []StockData) {
 	daysFound := 0
 	targetDate := time.Now()
 	
-	fmt.Printf("⏳ 開始抓取過去 20 日歷史軌跡，預計需要約 40 秒，請稍候...\n")
+	fmt.Printf("⏳ 開始抓取過去 20 日歷史軌跡，預計需要約 2~3 分鐘 (加入安全延遲以防阻擋)，請稍候...\n")
 
 	// 最多往前找 35 天 (避開假日與連假)
 	for attempts := 0; attempts < 35 && daysFound < daysNeeded; attempts++ {
@@ -170,7 +171,8 @@ func scanBollingerBands(stocks []StockData) {
 		
 		resp, err := http.Get(url)
 		if err != nil {
-			time.Sleep(1 * time.Second)
+			fmt.Printf("   ⚠️ 連線失敗 (%s)，重試中...\n", dateStr)
+			time.Sleep(time.Duration(5+rand.Intn(3)) * time.Second)
 			continue
 		}
 		
@@ -179,16 +181,32 @@ func scanBollingerBands(stocks []StockData) {
 		resp.Body.Close()
 		
 		if err != nil {
-			time.Sleep(1 * time.Second)
+			// 若 JSON 解析失敗，極高機率是被證交所回傳了防爬蟲 HTML 頁面
+			fmt.Printf("   ⚠️ 解析 %s 資料失敗 (極可能已被證交所防爬蟲阻擋 IP)\n", dateStr)
+			time.Sleep(time.Duration(10+rand.Intn(5)) * time.Second) // 遭遇阻擋時退避更久
 			continue
 		}
 
 		var dataList []interface{}
-		for k, v := range result {
-			if strings.HasPrefix(k, "data") {
-				if list, ok := v.([]interface{}); ok && len(list) > 500 {
-					dataList = list
-					break
+		// 支援 TWSE 新版 API 格式 (資料放在 tables 陣列中)
+		if tables, ok := result["tables"].([]interface{}); ok {
+			for _, tbl := range tables {
+				if tableMap, ok := tbl.(map[string]interface{}); ok {
+					if list, ok := tableMap["data"].([]interface{}); ok && len(list) > 500 {
+						dataList = list
+						break
+					}
+				}
+			}
+		}
+		// 兼容 TWSE 舊版 API 格式 (資料放在 data1, data9 等)
+		if len(dataList) == 0 {
+			for k, v := range result {
+				if strings.HasPrefix(k, "data") {
+					if list, ok := v.([]interface{}); ok && len(list) > 500 {
+						dataList = list
+						break
+					}
 				}
 			}
 		}
@@ -211,10 +229,12 @@ func scanBollingerBands(stocks []StockData) {
 				}
 			}
 			fmt.Printf("   > 已取得 %s 資料 (%d/%d)\n", dateStr, daysFound, daysNeeded)
+		} else {
+			fmt.Printf("   ⚠️ %s 無法找到股票清單 (可能是休市或格式改變)\n", dateStr)
 		}
 		
-		// ⚠️ 防擋延遲，避免被證交所封鎖 IP
-		time.Sleep(2 * time.Second)
+		// ⚠️ 防擋延遲，避免被證交所封鎖 IP (加入隨機 5~8 秒延遲)
+		time.Sleep(time.Duration(5+rand.Intn(4)) * time.Second)
 	}
 
 	// 3. 計算布林通道指標
@@ -235,7 +255,10 @@ func scanBollingerBands(stocks []StockData) {
 			}
 		}
 	}
-	fmt.Printf("✅ 布林通道分析完成！共計算 %d 檔熱門潛力股。\n", countBollinger)
+	fmt.Printf("✅ 布林通道分析完成！共成功計算 %d 檔熱門潛力股。\n", countBollinger)
+	if countBollinger == 0 {
+		fmt.Println("❌ 警告：布林通道計算數為 0，請確認是否觸發了 API 限制！")
+	}
 }
 
 // calculateBollinger 計算布林通道 (回傳 中軌, 上軌, 下軌)
@@ -297,7 +320,7 @@ func fillMissingPrices(stocks []StockData) {
 		
 		resp, err := http.Get(url)
 		if err != nil {
-			time.Sleep(1 * time.Second)
+			time.Sleep(time.Duration(3+rand.Intn(3)) * time.Second)
 			continue
 		}
 		
@@ -306,16 +329,30 @@ func fillMissingPrices(stocks []StockData) {
 		resp.Body.Close()
 		
 		if err != nil {
-			time.Sleep(1 * time.Second)
+			time.Sleep(time.Duration(5+rand.Intn(3)) * time.Second)
 			continue
 		}
 
 		var dataList []interface{}
-		for k, v := range result {
-			if strings.HasPrefix(k, "data") {
-				if list, ok := v.([]interface{}); ok && len(list) > 500 {
-					dataList = list
-					break
+		// 支援 TWSE 新版 API 格式 (資料放在 tables 陣列中)
+		if tables, ok := result["tables"].([]interface{}); ok {
+			for _, tbl := range tables {
+				if tableMap, ok := tbl.(map[string]interface{}); ok {
+					if list, ok := tableMap["data"].([]interface{}); ok && len(list) > 500 {
+						dataList = list
+						break
+					}
+				}
+			}
+		}
+		// 兼容 TWSE 舊版 API 格式 (資料放在 data1, data9 等)
+		if len(dataList) == 0 {
+			for k, v := range result {
+				if strings.HasPrefix(k, "data") {
+					if list, ok := v.([]interface{}); ok && len(list) > 500 {
+						dataList = list
+						break
+					}
 				}
 			}
 		}
@@ -349,7 +386,7 @@ func fillMissingPrices(stocks []StockData) {
 				fmt.Printf("✅ 從 %s 找回 %d 檔的有效收盤價，剩餘 %d 檔...\n", dateStr, foundCount, len(missing))
 			}
 		}
-		time.Sleep(1 * time.Second) 
+		time.Sleep(time.Duration(3+rand.Intn(3)) * time.Second) 
 	}
 }
 
@@ -439,6 +476,20 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 			continue 
 		}
 
+		// 確認這個指標是否有被成功計算 (如果全為 9999.0 代表沒計算)
+		calculatedCount := 0
+		if indicator == "Bollinger" {
+			for _, s := range stocks {
+				if s.Bollinger < 9000 {
+					calculatedCount++
+				}
+			}
+		} else {
+			calculatedCount = 1 // 其他單日指標預設有計算
+		}
+
+		hasValidStock := false
+
 		for _, stock := range stocks {
 			var valueStr string
 			var desc string
@@ -463,8 +514,8 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 				valueStr = fmt.Sprintf("%.2f", stock.ChipRatio)
 				desc = "籌碼集中度提升，顯示主力介入"
 			case "Bollinger":
-				// 若值為 9999 代表未計算，就不輸出
-				if stock.Bollinger > 9000 {
+				// 若值為 9999 代表未計算，或乖離率大於 5% (不夠貼近下軌)，就不輸出
+				if stock.Bollinger > 9000 || stock.Bollinger > 5.0 {
 					continue
 				}
 				valueStr = fmt.Sprintf("%.2f%%", stock.Bollinger)
@@ -475,6 +526,7 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 				}
 			}
 
+			hasValidStock = true
 			writer.Write([]string{
 				indicator,
 				stock.StockID,
@@ -483,6 +535,25 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 				strconv.Itoa(stock.Volume),       
 				valueStr,
 				desc,
+			})
+		}
+
+		// 如果該指標沒有任何符合條件的個股，則輸出一行提示
+		if !hasValidStock {
+			msg := "今日無符合條件個股"
+			// 🛡️ 防呆：如果根本沒算出來，要誠實地提示使用者，而不是假裝沒符合條件
+			if indicator == "Bollinger" && calculatedCount == 0 {
+				msg = "資料不足無法計算 (可能觸發證交所 IP 限制)"
+			}
+
+			writer.Write([]string{
+				indicator,
+				"-",
+				"-",
+				"-",
+				"-",
+				"-",
+				msg,
 			})
 		}
 	}
