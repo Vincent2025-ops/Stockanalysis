@@ -1,0 +1,2119 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"math"
+	"net/http"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/text/encoding/traditionalchinese"
+	"golang.org/x/text/transform"
+)
+
+// =========================================================
+// Wails 應用程式核心結構
+// =========================================================
+
+// App 應用程式的狀態與結構綁定
+type App struct {
+	ctx context.Context
+}
+
+// NewApp 建立並回傳一個新的 App 實例
+func NewApp() *App { return &App{} }
+
+// startup 在 Wails 應用程式啟動時被呼叫，用來保存 Context，以便後續呼叫系統資源
+func (a *App) startup(ctx context.Context) { a.ctx = ctx }
+
+// =========================================================
+// 🎯 核心強化：全域防封鎖與重試 HTTP 請求函數
+// =========================================================
+
+// httpGetWithRetry 封裝標準的 HTTP GET 請求，具備防封鎖機制（模擬正常瀏覽器行為、忽略 TLS 憑證驗證）
+// 遇到連線失敗或被阻擋時，會自動休眠 1 秒並重試，最高重試 2 次。
+func httpGetWithRetry(url string) (*http.Response, error) {
+	customTransport := &http.Transport{
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+		ForceAttemptHTTP2: false, 
+		DisableKeepAlives: true,
+	}
+
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: customTransport,
+	}
+
+	for i := 0; i < 2; i++ {
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7")
+		req.Header.Set("Cache-Control", "max-age=0")
+		req.Header.Set("Connection", "close")
+		
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode == 200 {
+			return resp, nil 
+		}
+		
+		if resp != nil {
+			resp.Body.Close()
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return nil, fmt.Errorf("HTTP 請求失敗，已達最大重試次數")
+}
+
+// parseFinancialNumber 將財經網頁中常見的數字格式字串（包含千分位逗號、全形符號、括號代表負數）
+// 轉換並清洗為標準的 float64 浮點數，若為無效字元則回傳 0。
+func parseFinancialNumber(s string) (float64, error) {
+	s = strings.TrimSpace(s)
+	isNegative := strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")")
+	
+	var clean strings.Builder
+	for _, ch := range s {
+		if (ch >= '0' && ch <= '9') || ch == '.' || ch == '-' {
+			clean.WriteRune(ch)
+		} else if ch == '－' { 
+			clean.WriteRune('-')
+		}
+	}
+	
+	val := clean.String()
+	
+	if val == "" || val == "-" || val == "--" || val == "." {
+		return 0, nil 
+	}
+
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return 0, err
+	}
+	
+	if isNegative && f > 0 {
+		f = -f
+	}
+	return f, nil
+}
+
+// cleanText 移除字串中的 HTML 標籤與多餘的空白、換行字元（如 &nbsp;、\t、\n 等），提煉出純文字。
+func cleanText(s string) string {
+	idx := strings.Index(s, ">")
+	if idx != -1 {
+		s = s[idx+1:]
+	}
+
+	var res strings.Builder
+	inTag := false
+	for _, ch := range s {
+		if ch == '<' {
+			inTag = true
+		} else if ch == '>' {
+			inTag = false
+		} else if !inTag {
+			res.WriteRune(ch)
+		}
+	}
+	
+	out := res.String()
+	out = strings.ReplaceAll(out, "&nbsp;", "")
+	out = strings.ReplaceAll(out, "\u00A0", "")
+	out = strings.ReplaceAll(out, " ", "")
+	out = strings.ReplaceAll(out, "\t", "")
+	out = strings.ReplaceAll(out, "\n", "")
+	out = strings.ReplaceAll(out, "\r", "")
+	return out
+}
+
+// extractCells 解析 HTML 表格的單列 (<tr>) 字串，萃取出所有 <td> 或 <th> 內的純文字內容，
+// 並以字串切片 (Slice) 的格式回傳，方便後續讀取欄位資料。
+func extractCells(row string) []string {
+	var cells []string
+	row = strings.ToLower(row)
+	for {
+		start := strings.Index(row, "<td")
+		if start == -1 {
+			start = strings.Index(row, "<th")
+		}
+		if start == -1 { break }
+		
+		row = row[start:]
+		closeBr := strings.Index(row, ">")
+		if closeBr == -1 { break }
+		
+		row = row[closeBr+1:]
+		
+		endTag := strings.Index(row, "</td")
+		if endTag == -1 {
+			endTag = strings.Index(row, "</th")
+		}
+		if endTag == -1 { break }
+		
+		content := row[:endTag]
+		cells = append(cells, cleanText(content))
+		row = row[endTag:]
+	}
+	return cells
+}
+
+// =========================================================
+// 🚀 全市場智慧解析器 (自動轉換中文股名為標準數字代號)
+// =========================================================
+
+// resolveStock 擔任股票代號與名稱的智慧解析器。
+// 允許使用者輸入完整的股號 (如: 2330)、完整股名 (如: 台積電)、或模糊股名 (如: 台積)。
+// 函式會向 TWSE 與 TPEX 請求當日最新報價清單進行比對，並回傳「標準代號」、「最新股價」與「完整名稱」。
+// 若為剛上市櫃尚無報價的純數字股號，會有防呆機制使其直接放行。
+func resolveStock(input string) (resolvedID string, price float64, name string, err error) {
+	input = strings.TrimSpace(input)
+	
+	var twseData []interface{}
+	var tpexData []map[string]interface{}
+
+	// 取得 TWSE 上市資料
+	respTWSE, errTWSE := httpGetWithRetry("https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json")
+	if errTWSE == nil {
+		var result map[string]interface{}
+		if json.NewDecoder(respTWSE.Body).Decode(&result) == nil {
+			if dataList, ok := result["data"].([]interface{}); ok {
+				twseData = dataList
+			}
+		}
+		respTWSE.Body.Close()
+	}
+
+	// 取得 TPEX 上櫃資料
+	respOTC, errOTC := httpGetWithRetry("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes")
+	if errOTC == nil {
+		bodyOtc, _ := ioutil.ReadAll(respOTC.Body)
+		json.Unmarshal(bodyOtc, &tpexData)
+		respOTC.Body.Close()
+	}
+
+	// 第一階段：完全比對 (包含代號與完整名稱)
+	for _, item := range twseData {
+		row := item.([]interface{})
+		id := strings.TrimSpace(fmt.Sprintf("%v", row[0]))
+		n := strings.TrimSpace(fmt.Sprintf("%v", row[1]))
+		if id == input || n == input {
+			p, _ := strconv.ParseFloat(strings.ReplaceAll(fmt.Sprintf("%v", row[7]), ",", ""), 64)
+			return id, p, n, nil
+		}
+	}
+	for _, item := range tpexData {
+		id := strings.TrimSpace(fmt.Sprintf("%v", item["SecuritiesCompanyCode"]))
+		n := strings.TrimSpace(fmt.Sprintf("%v", item["CompanyName"]))
+		if id == input || n == input {
+			p, _ := strconv.ParseFloat(strings.ReplaceAll(fmt.Sprintf("%v", item["Close"]), ",", ""), 64)
+			return id, p, n, nil
+		}
+	}
+
+	// 第二階段：模糊比對 (例如輸入 "台積" 可自動匹配 "台積電")
+	for _, item := range twseData {
+		row := item.([]interface{})
+		id := strings.TrimSpace(fmt.Sprintf("%v", row[0]))
+		n := strings.TrimSpace(fmt.Sprintf("%v", row[1]))
+		if strings.Contains(n, input) {
+			p, _ := strconv.ParseFloat(strings.ReplaceAll(fmt.Sprintf("%v", row[7]), ",", ""), 64)
+			return id, p, n, nil
+		}
+	}
+	for _, item := range tpexData {
+		id := strings.TrimSpace(fmt.Sprintf("%v", item["SecuritiesCompanyCode"]))
+		n := strings.TrimSpace(fmt.Sprintf("%v", item["CompanyName"]))
+		if strings.Contains(n, input) {
+			p, _ := strconv.ParseFloat(strings.ReplaceAll(fmt.Sprintf("%v", item["Close"]), ",", ""), 64)
+			return id, p, n, nil
+		}
+	}
+
+	// 防呆機制：若輸入全為數字但查無報價，視為剛上市櫃股票，直接以代號向下放行
+	isNumeric := true
+	for _, c := range input {
+		if c < '0' || c > '9' {
+			isNumeric = false
+			break
+		}
+	}
+	if isNumeric && len(input) > 0 {
+		return input, 0, "未知名稱", nil
+	}
+
+	return "", 0, "", fmt.Errorf("查無此股票，請確認輸入正確的名稱或代號")
+}
+
+
+// =========================================================
+// 分頁一：大盤與潛力股
+// =========================================================
+
+// Top10Stock 用於定義在潛力股面板中顯示的單一股票結構
+type Top10Stock struct {
+	Indicator string `json:"indicator"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Price     string `json:"price"`
+	Change    string `json:"change"`
+	Feature   string `json:"feature"`
+}
+
+// sortableStock 用於內部排序的輔助結構，結合了 Top10Stock 與該指標的評分值
+type sortableStock struct {
+	Top10Stock
+	Value float64 
+}
+
+// FetchTop10FromCloud 從 GitHub 雲端讀取由 CI/CD 每日更新的潛力股 CSV 資料。
+// 同時呼叫 TWSE 即時 API 取得個股的最新漲跌幅，根據不同的技術指標（RSI, KD, MACD 等）
+// 進行分組、排序，最後回傳各指標前 10 名的個股陣列給前端渲染。
+func (a *App) FetchTop10FromCloud() ([]Top10Stock, error) {
+	csvURL := "https://raw.githubusercontent.com/Vincent2025-ops/Stockanalysis/main/finish/Stock_TOP10.csv"
+	resp, err := httpGetWithRetry(csvURL)
+	if err != nil { return nil, fmt.Errorf("網路連線失敗: %v", err) }
+	defer resp.Body.Close()
+
+	reader := csv.NewReader(resp.Body)
+	records, err := reader.ReadAll()
+	if err != nil { return nil, fmt.Errorf("CSV 解析失敗: %v", err) }
+
+	twseMap := make(map[string]string)
+	respTWSE, errTWSE := httpGetWithRetry("https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json")
+	if errTWSE == nil {
+		defer respTWSE.Body.Close()
+		var result map[string]interface{}
+		if json.NewDecoder(respTWSE.Body).Decode(&result) == nil {
+			if dataList, ok := result["data"].([]interface{}); ok {
+				for _, item := range dataList {
+					row := item.([]interface{})
+					id := fmt.Sprintf("%v", row[0])
+					change := strings.TrimSpace(fmt.Sprintf("%v", row[8]))
+					twseMap[id] = change
+				}
+			}
+		}
+	}
+
+	grouped := make(map[string][]sortableStock)
+	for i := 1; i < len(records); i++ {
+		row := records[i]
+		if len(row) >= 7 {
+			id := strings.TrimSpace(row[1])
+			
+			volStr := strings.ReplaceAll(strings.TrimSpace(row[4]), ",", "")
+			vol, _ := strconv.ParseFloat(volStr, 64)
+			if vol < 500000 {
+				continue 
+			}
+
+			change := twseMap[id] 
+			
+			indicator := strings.TrimSpace(row[0])
+			val, _ := strconv.ParseFloat(strings.TrimSpace(row[5]), 64)
+
+			desc := ""
+			switch indicator {
+			case "RSI":
+				desc = "RSI 處於極低檔，具有極高超賣反彈爆發潛力"
+			case "KD":
+				desc = "KD 處於低檔超賣區，具備低檔黃金交叉佈局契機"
+			case "MACD":
+				desc = "MACD 柱狀圖動能強勁，處於多頭強勢上升趨勢"
+			case "SMA":
+				desc = "股價強勢突破均線表態，技術面全面轉強"
+			case "Momentum":
+				desc = "動能指標急遽上升，市場買盤正積極湧入"
+			case "ChipRatio":
+				desc = "成交量顯著放大且籌碼集中，主力大戶明顯介入"
+			default:
+				desc = strings.TrimSpace(row[6])
+			}
+
+			stock := sortableStock{
+				Top10Stock: Top10Stock{
+					Indicator: indicator, 
+					ID:        id, 
+					Name:      strings.TrimSpace(row[2]), 
+					Price:     strings.TrimSpace(row[3]), 
+					Change:    change, 
+					Feature:   desc, 
+				},
+				Value: val,
+			}
+			grouped[indicator] = append(grouped[indicator], stock)
+		}
+	}
+
+	var finalResults []Top10Stock
+	order := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "ChipRatio"} 
+
+	for _, ind := range order {
+		stocks, ok := grouped[ind]
+		if !ok || len(stocks) == 0 {
+			continue
+		}
+
+		sort.Slice(stocks, func(i, j int) bool {
+			if ind == "RSI" || ind == "KD" {
+				return stocks[i].Value < stocks[j].Value 
+			}
+			return stocks[i].Value > stocks[j].Value 
+		})
+
+		limit := 10
+		if len(stocks) < limit {
+			limit = len(stocks)
+		}
+
+		for _, s := range stocks[:limit] {
+			finalResults = append(finalResults, s.Top10Stock)
+		}
+	}
+
+	return finalResults, nil
+}
+
+// ExportMarketData 呼叫證交所 API 取得全市場當日交易資訊（開高低收、成交量等），
+// 並加上 UTF-8 BOM 標頭後，匯出成 CSV 檔案儲存於使用者的本地端。
+func (a *App) ExportMarketData() (string, error) {
+	resp, err := httpGetWithRetry("https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json")
+	if err != nil { return "", err }
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	dataList, ok := result["data"].([]interface{})
+	if !ok { return "", fmt.Errorf("API 回傳格式錯誤") }
+
+	filename := fmt.Sprintf("Stock_AllPrice_%s.csv", time.Now().Format("20060102"))
+	file, _ := os.Create(filename)
+	defer file.Close()
+	file.WriteString("\xEF\xBB\xBF")
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	writer.Write([]string{"股票代號", "名稱", "成交量", "成交金額", "開盤價", "最高價", "最低價", "收盤價", "漲跌價"})
+	count := 0
+	for _, item := range dataList {
+		row := item.([]interface{})
+		if len(row) >= 9 {
+			csvRow := make([]string, 9)
+			for i := 0; i < 9; i++ { csvRow[i] = fmt.Sprintf("%v", row[i]) }
+			writer.Write(csvRow)
+			count++
+		}
+	}
+	return fmt.Sprintf("✅ 成功匯出 %d 檔股票至 %s", count, filename), nil
+}
+
+// =========================================================
+// ✨ 新增：N 字型量縮突破策略 (全市場高併發掃描引擎)
+// =========================================================
+
+// FetchNBreakout 執行全市場 N 字型量縮突破的掃描邏輯。
+// 結合 4 大條件 (基期保護、主力表態紅K、量縮洗盤、支撐確認) 以及 1 項產業風口過濾。
+func (a *App) FetchNBreakout() ([]Top10Stock, error) {
+	type stockCandidate struct {
+		ID     string
+		Name   string
+		Price  float64
+		Change string
+		Volume float64
+	}
+	var candidates []stockCandidate
+
+	// ==========================================
+	// 階段一：快速抓取全市場基礎資料與產業資訊
+	// ==========================================
+	
+	// 抓取公司產業與業務資訊 (供後續「主流產業」與「主要產品」檢核用)
+	type CompanyInfo struct {
+		Industry    string
+		MainProduct string
+	}
+	companyInfoMap := make(map[string]CompanyInfo)
+
+	// 透過政府 OpenAPI 取得 TWSE 產業資訊
+	if respTWSEInfo, err := httpGetWithRetry("https://openapi.twse.com.tw/v1/opendata/t187ap03_L"); err == nil {
+		var data []map[string]interface{}
+		body, _ := ioutil.ReadAll(respTWSEInfo.Body)
+		if json.Unmarshal(body, &data) == nil {
+			for _, c := range data {
+				id := fmt.Sprintf("%v", c["公司代號"])
+				ind := fmt.Sprintf("%v", c["產業類別"])
+				prod := fmt.Sprintf("%v", c["主要業務"])
+				companyInfoMap[id] = CompanyInfo{Industry: ind, MainProduct: prod}
+			}
+		}
+		respTWSEInfo.Body.Close()
+	}
+
+	// 透過政府 OpenAPI 取得 TPEX 產業資訊
+	if respTPEXInfo, err := httpGetWithRetry("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"); err == nil {
+		var data []map[string]interface{}
+		body, _ := ioutil.ReadAll(respTPEXInfo.Body)
+		if json.Unmarshal(body, &data) == nil {
+			for _, c := range data {
+				id := fmt.Sprintf("%v", c["公司代號"])
+				ind := fmt.Sprintf("%v", c["產業類別"])
+				prod := fmt.Sprintf("%v", c["主要業務"])
+				companyInfoMap[id] = CompanyInfo{Industry: ind, MainProduct: prod}
+			}
+		}
+		respTPEXInfo.Body.Close()
+	}
+
+	// 1. 快速抓取 TWSE 上市股票並過濾活躍股
+	respTWSE, errTWSE := httpGetWithRetry("https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json")
+	if errTWSE == nil {
+		var result map[string]interface{}
+		if json.NewDecoder(respTWSE.Body).Decode(&result) == nil {
+			if dataList, ok := result["data"].([]interface{}); ok {
+				for _, item := range dataList {
+					row := item.([]interface{})
+					id := strings.TrimSpace(fmt.Sprintf("%v", row[0]))
+					name := strings.TrimSpace(fmt.Sprintf("%v", row[1]))
+					volStr := strings.ReplaceAll(fmt.Sprintf("%v", row[2]), ",", "")
+					vol, _ := strconv.ParseFloat(volStr, 64)
+					priceStr := strings.ReplaceAll(fmt.Sprintf("%v", row[7]), ",", "")
+					price, _ := strconv.ParseFloat(priceStr, 64)
+					change := strings.TrimSpace(fmt.Sprintf("%v", row[8]))
+					
+					// 初步過濾：成交量 >= 2000張 且 股價 >= 10元
+					if vol >= 2000000 && price >= 10 {
+						candidates = append(candidates, stockCandidate{ID: id, Name: name, Price: price, Change: change, Volume: vol})
+					}
+				}
+			}
+		}
+		respTWSE.Body.Close()
+	}
+
+	// 2. 快速抓取 TPEX 上櫃股票並過濾活躍股
+	respOTC, errOTC := httpGetWithRetry("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes")
+	if errOTC == nil {
+		var tpexData []map[string]interface{}
+		bodyOtc, _ := ioutil.ReadAll(respOTC.Body)
+		if json.Unmarshal(bodyOtc, &tpexData) == nil {
+			for _, item := range tpexData {
+				id := strings.TrimSpace(fmt.Sprintf("%v", item["SecuritiesCompanyCode"]))
+				name := strings.TrimSpace(fmt.Sprintf("%v", item["CompanyName"]))
+				volStr := strings.ReplaceAll(fmt.Sprintf("%v", item["TradingVolume"]), ",", "")
+				vol, _ := strconv.ParseFloat(volStr, 64)
+				priceStr := strings.ReplaceAll(fmt.Sprintf("%v", item["Close"]), ",", "")
+				price, _ := strconv.ParseFloat(priceStr, 64)
+				change := strings.TrimSpace(fmt.Sprintf("%v", item["Change"]))
+				
+				if vol >= 2000000 && price >= 10 {
+					candidates = append(candidates, stockCandidate{ID: id, Name: name, Price: price, Change: change, Volume: vol})
+				}
+			}
+		}
+		respOTC.Body.Close()
+	}
+
+	// 依據成交量排序，取全市場前 300 檔最具流動性的熱門股進入漏斗掃描
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Volume > candidates[j].Volume
+	})
+	limit := 300
+	if len(candidates) < limit { limit = len(candidates) }
+	candidates = candidates[:limit]
+
+	now := time.Now()
+	// 往回推 7 個月：確保有足夠交易日算出 120MA (半年線)
+	sevenMonthsAgo := now.AddDate(0, -7, 0)
+
+	// ==========================================
+	// 階段二：高併發 (Worker Pool) 獲取 K 線與邏輯判斷
+	// ==========================================
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 15) // Worker Pool: 控制最大併發數 15，防擋
+	var mu sync.Mutex
+	
+	type nBreakoutResult struct {
+		StockID  string
+		Name     string
+		Price    float64
+		Change   string
+		Score    float64
+		Feature  string
+	}
+	var breakoutStocks []nBreakoutResult
+
+	for _, c := range candidates {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(cand stockCandidate) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			// 取得產業資訊
+			info, hasInfo := companyInfoMap[cand.ID]
+			if !hasInfo { return } // 無法取得產業資訊直接淘汰
+
+			// --- 【過濾條件 3】：看產業風口 (是不是目前市場最缺、毛利最高的那一塊) ---
+			// 定義當前市場熱門的主流產業與產品關鍵字
+			mainstreamKeywords := []string{"半導體", "電腦", "電子", "光電", "通信", "網通", "電機", "電纜", "綠能", "雲端", "AI", "伺服器", "散熱", "晶片", "IC", "矽", "自動化", "零組件", "重電", "資料中心"}
+			isMainstream := false
+			for _, kw := range mainstreamKeywords {
+				if strings.Contains(info.Industry, kw) || strings.Contains(info.MainProduct, kw) {
+					isMainstream = true
+					break
+				}
+			}
+			if !isMainstream { return } // 不是主流，就不買
+
+			// 下載歷史 K 線 (取得近 7 個月的資料)
+			records, err := downloadYahooFinance(cand.ID, sevenMonthsAgo.Unix(), now.Unix())
+			if err != nil || len(records) < 120 { return } // 若資料不足 120 天則無法算半年線，跳過
+
+			var opens, lows, closes, vols []float64
+			for i := 1; i < len(records); i++ {
+				row := records[i]
+				if len(row) < 7 || row[1] == "null" { continue } 
+				o, _ := strconv.ParseFloat(row[1], 64)
+				l, _ := strconv.ParseFloat(row[3], 64)
+				closeP, _ := strconv.ParseFloat(row[4], 64)
+				v, _ := strconv.ParseFloat(row[6], 64)
+				
+				opens = append(opens, o)
+				lows = append(lows, l)
+				closes = append(closes, closeP)
+				vols = append(vols, v)
+			}
+
+			n := len(closes)
+			if n < 120 { return } 
+
+			todayClose := closes[n-1]
+			todayVol := vols[n-1]
+			yesterdayVol := vols[n-2]
+
+			// --- 【過濾條件 2】：往上看均線 (上面有沒有下彎的長天期均線壓著) ---
+			// 計算今日與昨日的 120MA (半年線)
+			sum120Today, sum120Yest := 0.0, 0.0
+			for i := n - 120; i < n; i++ { sum120Today += closes[i] }
+			for i := n - 121; i < n - 1; i++ { sum120Yest += closes[i] }
+			ma120Today := sum120Today / 120.0
+			ma120Yest := sum120Yest / 120.0
+
+			// 邏輯：如果目前股價在 120MA 之下，且 120MA 正在下彎 (今天均值 < 昨天均值)，代表長天期壓力太大
+			if todayClose < ma120Today && ma120Today <= ma120Yest { return }
+
+			// --- 原有條件 1：基期保護 (確保在底部，非高檔套牢區。季線乖離 0~10%) ---
+			sum60 := 0.0
+			for i := n - 60; i < n; i++ { sum60 += closes[i] }
+			ma60 := sum60 / 60.0
+			bias60 := (todayClose - ma60) / ma60
+			if bias60 < 0 || bias60 > 0.10 { return } // 濾掉已經漲上天的股票
+
+			// 提前計算 10MA 供後續支撐確認使用
+			sum10 := 0.0
+			for i := n - 10; i < n; i++ { sum10 += closes[i] }
+			ma10 := sum10 / 10.0
+
+			// --- 【過濾條件 1】：主力試單 (往前看 10 天，有沒有出現過「成交量放大 2 倍以上的長紅 K」) ---
+			ignitionFound := false
+			var ignitionVol, ignitionLow float64
+			searchStart := n - 10
+			if searchStart < 6 { searchStart = 6 }
+			
+			// 搜尋區間：避開最近2日(那是在洗盤)，回溯前 10 天
+			for i := n - 3; i >= searchStart; i-- {
+				sumV5 := 0.0
+				for j := i - 5; j < i; j++ { sumV5 += vols[j] }
+				avgV5 := sumV5 / 5.0
+				if avgV5 == 0 { continue }
+				
+				gain := (closes[i] - closes[i-1]) / closes[i-1]
+				isRedK := closes[i] > opens[i] // 長紅 K：收盤價必須大於開盤價
+				
+				// 邏輯：沒有長紅K表態、漲幅不夠、量沒有放大2倍，就不算主力點火
+				if isRedK && gain > 0.04 && vols[i] > 2*avgV5 {
+					ignitionFound = true
+					ignitionVol = vols[i]
+					ignitionLow = lows[i]
+					break // 找到離現在最近的一根起漲紅 K 即停止
+				}
+			}
+			if !ignitionFound { return } // 沒有表態，就不買
+
+			// --- 原有條件 3：洗盤特徵 (近 2 日成交量皆 < 起漲爆量日的 50%，最好是窒息量) ---
+			if todayVol >= 0.5*ignitionVol || yesterdayVol >= 0.5*ignitionVol { return }
+
+			// --- 原有條件 4：支撐確認 (今日收盤價 > 10MA 且 > 起漲日紅K的最低點，代表跌不下去) ---
+			if todayClose <= ma10 || todayClose <= ignitionLow { return }
+
+			// 評分機制：量縮得越極致(窒息)，分數越高
+			volRatio := (todayVol / ignitionVol) * 100
+			score := 100.0 - volRatio 
+
+			// 處理產品名稱過長的問題 (只取前 18 個字)
+			prodDesc := info.MainProduct
+			prodRunes := []rune(strings.ReplaceAll(prodDesc, "\n", ""))
+			if len(prodRunes) > 18 {
+				prodDesc = string(prodRunes[:18]) + "..."
+			}
+
+			// 組合出含有產業與產品特徵的最終描述字串
+			feature := fmt.Sprintf("【%s】主力產品：%s。底部量縮發動！季線乖離%.1f%%，急縮至爆量日%.0f%%", info.Industry, prodDesc, bias60*100, volRatio)
+
+			mu.Lock()
+			breakoutStocks = append(breakoutStocks, nBreakoutResult{
+				StockID:  cand.ID,
+				Name:     cand.Name,
+				Price:    cand.Price,
+				Change:   cand.Change,
+				Score:    score,
+				Feature:  feature,
+			})
+			mu.Unlock()
+
+		}(c)
+	}
+
+	wg.Wait() // 等待所有 Worker 掃描完畢
+
+	// 依分數 (量縮極致程度) 由高至低排序
+	sort.Slice(breakoutStocks, func(i, j int) bool {
+		return breakoutStocks[i].Score > breakoutStocks[j].Score
+	})
+
+	// 輸出轉換給前端，最多只取前 10 檔最精華的潛力股
+	results := []Top10Stock{}
+	for i, b := range breakoutStocks {
+		if i >= 10 { break }
+		results = append(results, Top10Stock{
+			Indicator: "N字量縮洗盤",
+			ID:        b.StockID,
+			Name:      b.Name,
+			Price:     fmt.Sprintf("%.2f", b.Price),
+			Change:    b.Change,
+			Feature:   b.Feature,
+		})
+	}
+
+	return results, nil
+}
+
+// =========================================================
+// 分頁二：個股深度診斷
+// =========================================================
+type BasicInfo struct {
+	PE         string `json:"pe"`
+	PB         string `json:"pb"`
+	ROE        string `json:"roe"`
+	EPS        string `json:"eps"`
+	Assessment string `json:"assessment"`
+}
+type InstitutionalData struct {
+	Foreign    int `json:"foreign"`
+	Investment int `json:"investment"`
+	Dealer     int `json:"dealer"`
+	Total      int `json:"total"`
+}
+type MarginDetail struct {
+	FinBuy            float64  `json:"finBuy"`
+	FinSell           float64  `json:"finSell"`
+	FinCashRepay      float64  `json:"finCashRepay"`
+	FinPrevBalance    float64  `json:"finPrevBalance"`
+	FinCurrentBalance float64  `json:"finCurrentBalance"`
+	FinQuota          float64  `json:"finQuota"`
+	FinUsage          float64  `json:"finUsage"`
+	FinChangeRate     float64  `json:"finChangeRate"`
+	SecBuy            float64  `json:"secBuy"`
+	SecSell           float64  `json:"secSell"`
+	SecStockRepay     float64  `json:"secStockRepay"`
+	SecPrevBalance    float64  `json:"secPrevBalance"`
+	SecCurrentBalance float64  `json:"secCurrentBalance"`
+	SecQuota          float64  `json:"secQuota"`
+	SecUsage          float64  `json:"secUsage"`
+	SecChangeRate     float64  `json:"secChangeRate"`
+	FiveDayAvgShort   float64  `json:"fiveDayAvgShort"`
+	MarginShortRatio  float64  `json:"marginShortRatio"`
+	SqueezeForce      float64  `json:"squeezeForce"`
+	ShortSqueezeStr   float64  `json:"shortSqueezeStr"`
+	TrendEvals        []string `json:"trendEvals"`
+	SqueezeEval       string   `json:"squeezeEval"`
+	ShortSqueezeEval  string   `json:"shortSqueezeEval"`
+}
+type RetailData struct {
+	DayTradeRatio        float64      `json:"dayTradeRatio"`
+	MarginShortRatio     float64      `json:"marginShortRatio"`
+	SqueezeForce         float64      `json:"squeezeForce"`
+	ShortSqueezeStrength float64      `json:"shortSqueezeStrength"`
+	Sentiment            string       `json:"sentiment"`
+	Detail               MarginDetail `json:"detail"`
+}
+
+type ChipsData struct {
+	MajorForceRatio  float64   `json:"majorForceRatio"`
+	Concentration    string    `json:"concentration"`
+	TurnoverRate     float64   `json:"turnoverRate"`
+}
+type StockAnalysisResult struct {
+	StockId       string            `json:"stockId"`
+	StockName     string            `json:"stockName"`
+	Date          string            `json:"date"`
+	Trend         string            `json:"trend"`
+	Basic         BasicInfo         `json:"basic"`
+	Institutional InstitutionalData `json:"institutional"`
+	Retail        RetailData        `json:"retail"`
+	Chips         ChipsData         `json:"chips"`
+}
+
+// FetchStockAnalysis 執行個股的深度診斷。
+// 接收使用者的輸入（可能是股號或股名），觸發多個 Goroutine 併發向證交所、櫃買中心與集保中心請求
+// 包含本益比(PE)、淨值比(PB)、三大法人進出、融資券變化與大股東籌碼等資料。
+// 最後將所有資料統整、計算指標（如擠壓力道、真實週轉率），並產生多空趨勢的評估字串。
+func (a *App) FetchStockAnalysis(input string) StockAnalysisResult {
+	date := getBaseTradingDate()
+	result := StockAnalysisResult{StockId: input, StockName: "查詢中...", Date: date, Trend: "中性"}
+
+	// ✨ 透過智慧解析器取得確切股號、價格與名稱
+	stockID, price, name, err := resolveStock(input)
+	if err != nil {
+		result.StockName = "❌ 查無此股票"
+		return result
+	}
+
+	result.StockId = stockID
+	result.StockName = name
+
+	var twsePE, twsePB float64
+	var f, inv, d, totalInst int
+	var dayTradeVol, totalVol, totalShares float64
+	var marginDetail MarginDetail
+	var errMargin error
+	
+	var superRatio, largeRatio float64
+	var hasDiff bool
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		twsePE, twsePB, _ = fetchPEAndPBFromTWSEOpenAPI(stockID)
+	}()
+
+	go func() {
+		defer wg.Done()
+		superRatio, largeRatio, hasDiff = fetchLargeShareholders(stockID)
+	}()
+
+	go func() {
+		defer wg.Done()
+		f, inv, d, totalInst = fetchInstitutional(stockID, date)
+		dayTradeVol = fetchDayTradingForStock(stockID, date)
+		totalVol = fetchDailyTotalVolume(stockID, date)
+		totalShares = fetchTotalShares(stockID)
+		marginDetail, errMargin = fetchAdvancedMarginData(stockID, date)
+	}()
+
+	wg.Wait()
+
+	result.Basic.EPS = "N/A"
+	result.Basic.ROE = "N/A"
+	result.Basic.PE = "N/A"
+	result.Basic.PB = "N/A"
+
+	if twsePB > 0 { 
+		result.Basic.PB = fmt.Sprintf("%.2f", twsePB) 
+	}
+	
+	if twsePE > 0 && price > 0 {
+		result.Basic.PE = fmt.Sprintf("%.2f", twsePE)
+		inferredEPS := price / twsePE
+		result.Basic.EPS = fmt.Sprintf("推估年:%.2f", inferredEPS)
+
+		if twsePB > 0 {
+			inferredBookValue := price / twsePB
+			inferredROE := (inferredEPS / inferredBookValue) * 100
+			result.Basic.ROE = fmt.Sprintf("推估年:%.2f%%", inferredROE)
+		}
+	} else if twsePE == 0 && twsePB > 0 {
+		result.Basic.PE = "負值(虧損)"
+		result.Basic.EPS = "虧損無PE"
+		result.Basic.ROE = "虧損無PE"
+	}
+
+	evalPE, evalPB := 0.0, 0.0
+	if result.Basic.PE != "N/A" && result.Basic.PE != "負值(虧損)" { evalPE, _ = strconv.ParseFloat(result.Basic.PE, 64) }
+	if result.Basic.PB != "N/A" { evalPB, _ = strconv.ParseFloat(result.Basic.PB, 64) }
+	
+	if result.Basic.PE == "負值(虧損)" || evalPE < 0 {
+		result.Basic.Assessment = "虧損狀態 (PE為負值，請參考 PB 與未來轉機)"
+	} else if evalPE > 0 && evalPE < 15 && evalPB > 0 && evalPB < 1.5 {
+		result.Basic.Assessment = "價值低估股 (PE<15, PB<1.5，落在便宜區間)"
+	} else if evalPE > 0 && evalPE < 30 && strings.Contains(result.Basic.ROE, "15") {
+		result.Basic.Assessment = "潛力成長股 (高ROE>15%，獲利能力優異)"
+	} else if evalPE > 30 || evalPB > 3 {
+		result.Basic.Assessment = "估值偏高 (PE>30 或 PB>3，留意追高風險)"
+	} else if result.Basic.PE == "N/A" {
+		result.Basic.Assessment = "目前財報/估值資訊不適用"
+	} else {
+		result.Basic.Assessment = "估值落在合理區間 (PE: 15~30, PB: 1.5~3)"
+	}
+
+	result.Institutional = InstitutionalData{Foreign: f, Investment: inv, Dealer: d, Total: totalInst}
+
+	if totalVol > 0 {
+		result.Retail.DayTradeRatio = (dayTradeVol / totalVol) * 100
+		if totalShares > 0 { result.Chips.TurnoverRate = (totalVol / totalShares) * 100 }
+	}
+
+	// ⚠️ 在此處將詳細的錯誤追蹤印出給前端
+	if errMargin == nil {
+		result.Retail.Detail = marginDetail
+		result.Retail.MarginShortRatio = marginDetail.MarginShortRatio 
+		result.Retail.SqueezeForce = marginDetail.SqueezeForce
+		result.Retail.ShortSqueezeStrength = marginDetail.ShortSqueezeStr
+		result.Retail.Sentiment = marginDetail.SqueezeEval
+	} else {
+		result.Retail.Detail = MarginDetail{
+			TrendEvals: []string{fmt.Sprintf("⚠️ 錯誤追蹤: %v", errMargin)},
+			SqueezeEval: "資料更新中或查無資券資料",
+			ShortSqueezeEval: "資料更新中",
+		}
+		result.Retail.Sentiment = "資料更新中"
+	}
+
+	result.Chips.MajorForceRatio = largeRatio
+	
+	if largeRatio > 60 || superRatio > 40 {
+		result.Chips.Concentration = "高度集中"
+	} else if largeRatio > 40 {
+		result.Chips.Concentration = "籌碼穩定"
+	} else {
+		result.Chips.Concentration = "籌碼渙散"
+	}
+	if !hasDiff { result.Chips.Concentration += " (單週)" }
+
+	if totalInst > 2000 && result.Retail.SqueezeForce > 5 {
+		result.Trend = "強烈偏多 (法人買+擠壓多方)"
+	} else if totalInst < -2000 {
+		result.Trend = "偏空 (法人大賣)"
+	} else {
+		result.Trend = "中性震盪"
+	}
+
+	return result
+}
+
+// =========================================================
+// 分頁三：歷史回測 (Yahoo Finance JSON API 還原股價雙軌引擎)
+// =========================================================
+
+type TradeRecord struct {
+	Date    string  `json:"date"`
+	Action  string  `json:"action"` 
+	Price   float64 `json:"price"`
+	Shares  float64 `json:"shares"`
+	Capital float64 `json:"capital"`
+	Profit  float64 `json:"profit"`
+}
+
+type BacktestResult struct {
+	Strategy     string        `json:"strategy"`
+	Description  string        `json:"description"` 
+	TotalReturn  float64       `json:"totalReturn"`
+	MaxDrawdown  float64       `json:"maxDrawdown"`
+	WinRate      float64       `json:"winRate"`
+	FinalCapital float64       `json:"finalCapital"`
+	Trades       []TradeRecord `json:"trades"`      
+}
+
+type BacktestSummary struct {
+	StockId   string           `json:"stockId"` // ✨ 新增回傳標準轉換後的代號
+	StockName string           `json:"stockName"`
+	Labels    []string         `json:"labels"`
+	Prices    []float64        `json:"prices"`
+	Results   []BacktestResult `json:"results"`
+}
+
+// downloadYahooFinance 呼叫 Yahoo Finance Chart API 獲取個股指定時間段內的「還原股價」與「交易量」等 K 線數據。
+// 自動測試 .TW (上市) 與 .TWO (上櫃) 後綴，若找到資料則整理並回傳。
+func downloadYahooFinance(stockID string, period1, period2 int64) ([][]string, error) {
+	suffixes := []string{".TW", ".TWO"}
+	
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	for _, suffix := range suffixes {
+		url := fmt.Sprintf("https://query2.finance.yahoo.com/v8/finance/chart/%s%s?period1=%d&period2=%d&interval=1d", stockID, suffix, period1, period2)
+		
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "application/json")
+		
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode == 200 {
+			body, _ := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			
+			var result map[string]interface{}
+			if err := json.Unmarshal(body, &result); err != nil { continue }
+			
+			chart, ok := result["chart"].(map[string]interface{})
+			if !ok { continue }
+			resArray, ok := chart["result"].([]interface{})
+			if !ok || len(resArray) == 0 || resArray[0] == nil { continue }
+			
+			firstResult := resArray[0].(map[string]interface{})
+			timestamps, ok1 := firstResult["timestamp"].([]interface{})
+			indicators, ok2 := firstResult["indicators"].(map[string]interface{})
+			if !ok1 || !ok2 { continue }
+			
+			quoteArray, ok3 := indicators["quote"].([]interface{})
+			adjCloseArray, ok4 := indicators["adjclose"].([]interface{})
+			if !ok3 || !ok4 || len(quoteArray) == 0 || len(adjCloseArray) == 0 { continue }
+			
+			quote, ok5 := quoteArray[0].(map[string]interface{})
+			adjCloseObj, ok6 := adjCloseArray[0].(map[string]interface{})
+			if !ok5 || !ok6 { continue }
+			
+			opens, _ := quote["open"].([]interface{})
+			highs, _ := quote["high"].([]interface{})
+			lows, _ := quote["low"].([]interface{})
+			closes, _ := quote["close"].([]interface{})
+			volumes, _ := quote["volume"].([]interface{})
+			adjCloses, _ := adjCloseObj["adjclose"].([]interface{})
+			
+			if len(timestamps) != len(opens) { continue }
+			
+			var records [][]string
+			records = append(records, []string{"Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"})
+			
+			for i := 0; i < len(timestamps); i++ {
+				if i >= len(opens) || i >= len(highs) || i >= len(lows) || i >= len(closes) || i >= len(adjCloses) || i >= len(volumes) { break }
+				if opens[i] == nil || highs[i] == nil || lows[i] == nil || closes[i] == nil || adjCloses[i] == nil || volumes[i] == nil { continue }
+				
+				t := int64(timestamps[i].(float64))
+				dateStr := time.Unix(t, 0).Format("2006-01-02")
+				
+				records = append(records, []string{
+					dateStr,
+					fmt.Sprintf("%f", opens[i].(float64)),
+					fmt.Sprintf("%f", highs[i].(float64)),
+					fmt.Sprintf("%f", lows[i].(float64)),
+					fmt.Sprintf("%f", closes[i].(float64)),
+					fmt.Sprintf("%f", adjCloses[i].(float64)),
+					fmt.Sprintf("%f", volumes[i].(float64)),
+				})
+			}
+			
+			if len(records) > 1 { return records, nil }
+		} else if resp != nil { resp.Body.Close() }
+	}
+	return nil, fmt.Errorf("Yahoo Finance 拒絕連線或無資料")
+}
+
+// DownloadStockHistory 供前端調用以下載個股的歷史資料。
+// 優先呼叫 Yahoo Finance 獲取具備「還原權息」的歷史價格；
+// 若 Yahoo 失敗或無資料，則啟動退回機制，向證交所爬取過去 12 個月的未還原歷史交易資料並存為 CSV。
+func (a *App) DownloadStockHistory(input string) (string, error) {
+	stockID, _, _, err := resolveStock(input)
+	if err != nil {
+		return "", fmt.Errorf("查無此股票，請確認輸入正確名稱或代號")
+	}
+
+	filename := fmt.Sprintf("%s_stock_data.csv", stockID)
+	file, err := os.Create(filename)
+	if err != nil { return "", err }
+	defer file.Close()
+	
+	file.WriteString("\xEF\xBB\xBF")
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+	
+	writer.Write([]string{"Date", "Open", "High", "Low", "Close", "Volume"})
+	
+	now := time.Now()
+	oneYearAgo := now.AddDate(-1, 0, 0)
+	
+	records, errYahoo := downloadYahooFinance(stockID, oneYearAgo.Unix(), now.Unix())
+	if errYahoo == nil {
+		totalRecords := 0
+		for i, row := range records {
+			if i == 0 || len(row) < 7 || row[1] == "null" { continue }
+			
+			dateStr := row[0]
+			open, _ := strconv.ParseFloat(row[1], 64)
+			high, _ := strconv.ParseFloat(row[2], 64)
+			low, _ := strconv.ParseFloat(row[3], 64)
+			closeP, _ := strconv.ParseFloat(row[4], 64)
+			adjClose, _ := strconv.ParseFloat(row[5], 64)
+			vol, _ := strconv.ParseFloat(row[6], 64)
+
+			ratio := 1.0
+			if closeP > 0 { ratio = adjClose / closeP }
+
+			writer.Write([]string{
+				dateStr,
+				fmt.Sprintf("%.2f", open*ratio),
+				fmt.Sprintf("%.2f", high*ratio),
+				fmt.Sprintf("%.2f", low*ratio),
+				fmt.Sprintf("%.2f", adjClose),
+				fmt.Sprintf("%.0f", vol),
+			})
+			totalRecords++
+		}
+		return fmt.Sprintf("✅ 成功從 Yahoo 下載 %d 筆【還原】歷史資料至 %s", totalRecords, filename), nil
+	}
+
+	totalRecords := 0
+	for i := 11; i >= 0; i-- { 
+		targetMonth := now.AddDate(0, -i, 0).Format("20060102")
+		url := fmt.Sprintf("https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date=%s&stockNo=%s", targetMonth, stockID)
+		
+		resp, err := httpGetWithRetry(url)
+		if err == nil {
+			var result map[string]interface{}
+			json.NewDecoder(resp.Body).Decode(&result)
+			resp.Body.Close()
+			if dataList, ok := result["data"].([]interface{}); ok {
+				for _, item := range dataList {
+					row := item.([]interface{})
+					if len(row) < 9 { continue }
+					
+					twseDate := fmt.Sprintf("%v", row[0]) 
+					parts := strings.Split(twseDate, "/")
+					dateStr := ""
+					if len(parts) == 3 {
+						y, _ := strconv.Atoi(parts[0])
+						m, _ := strconv.Atoi(parts[1])
+						d, _ := strconv.Atoi(parts[2])
+						dateStr = fmt.Sprintf("%04d-%02d-%02d", y+1911, m, d)
+					}
+					
+					volStr := strings.ReplaceAll(fmt.Sprintf("%v", row[1]), ",", "")
+					openStr := strings.ReplaceAll(fmt.Sprintf("%v", row[3]), ",", "")
+					highStr := strings.ReplaceAll(fmt.Sprintf("%v", row[4]), ",", "")
+					lowStr := strings.ReplaceAll(fmt.Sprintf("%v", row[5]), ",", "")
+					closeStr := strings.ReplaceAll(fmt.Sprintf("%v", row[6]), ",", "")
+					
+					openStr = strings.ReplaceAll(openStr, "X", "")
+					highStr = strings.ReplaceAll(highStr, "X", "")
+					lowStr = strings.ReplaceAll(lowStr, "X", "")
+					closeStr = strings.ReplaceAll(closeStr, "X", "")
+
+					writer.Write([]string{dateStr, openStr, highStr, lowStr, closeStr, volStr})
+					totalRecords++
+				}
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+	
+	if totalRecords > 0 {
+		return fmt.Sprintf("⚠️ Yahoo 連線失敗，退回 TWSE 下載 %d 筆【未還原】資料至 %s", totalRecords, filename), nil
+	}
+
+	return "", fmt.Errorf("下載失敗：Yahoo 與證交所皆無回應，請確認網路連線")
+}
+
+func (a *App) RunBacktest(input string, months int) (BacktestSummary, error) {
+	var emptySummary BacktestSummary
+	
+	// ✨ 透過智慧解析器取得確切代號與名稱
+	stockID, _, stockName, err := resolveStock(input)
+	if err != nil {
+		return emptySummary, fmt.Errorf("查無此股票，請確認輸入正確名稱或代號")
+	}
+
+	filename := fmt.Sprintf("%s_stock_data.csv", stockID)
+	if _, err := os.Stat(filename); os.IsNotExist(err) { return emptySummary, fmt.Errorf("請先下載資料") }
+	
+	file, _ := os.Open(filename)
+	defer file.Close()
+	reader := csv.NewReader(file)
+	
+	reader.LazyQuotes = true
+	reader.FieldsPerRecord = -1
+
+	rows, err := reader.ReadAll()
+	if err != nil {
+		fmt.Println("CSV 讀取警告:", err) 
+	}
+
+	var prices, highs, lows []float64 
+	var dates []time.Time
+	var rawDates []string
+
+	for i, row := range rows {
+		if i == 0 || len(row) < 6 { continue }
+		
+		dateStr := row[0]
+		hStr := row[2]
+		lStr := row[3]
+		pStr := row[4]
+		
+		h, _ := strconv.ParseFloat(hStr, 64)
+		l, _ := strconv.ParseFloat(lStr, 64)
+		p, _ := strconv.ParseFloat(pStr, 64)
+		
+		if p > 0 {
+			parsedDate, _ := time.Parse("2006-01-02", dateStr)
+			
+			highs = append(highs, h)
+			lows = append(lows, l)
+			prices = append(prices, p)
+			dates = append(dates, parsedDate)
+			rawDates = append(rawDates, dateStr)
+		}
+	}
+	
+	if len(prices) < 30 { 
+		return emptySummary, fmt.Errorf("有效交易天數僅 %d 天，數據不足以進行回測", len(prices)) 
+	}
+
+	startIndex := 0
+	if months > 0 && months < 12 && len(dates) > 0 {
+		latestDate := dates[len(dates)-1]
+		targetDate := latestDate.AddDate(0, -months, 0)
+		for i, d := range dates {
+			if !d.IsZero() && (d.After(targetDate) || d.Equal(targetDate)) {
+				startIndex = i
+				break
+			}
+		}
+	}
+
+	if startIndex >= len(prices) { startIndex = 0 }
+	
+	evalPrices := prices[startIndex:]
+	evalDates := rawDates[startIndex:]
+	
+	if len(evalPrices) < 5 {
+		return emptySummary, fmt.Errorf("所選時間區間內數據不足 (%d 天)", len(evalPrices))
+	}
+
+	var results []BacktestResult
+	results = append(results, simulateStrategy("RSI 策略 (<30買, >70賣)", "指標跌破 30 時超賣買進，突破 70 時超買平倉", evalDates, evalPrices, runRSILogic(prices)[startIndex:]))
+	results = append(results, simulateStrategy("SMA 策略 (突破月線買)", "收盤價突破 20 日均線(月線)時買進，跌破時平倉", evalDates, evalPrices, runSMALogic(prices)[startIndex:]))
+	results = append(results, simulateStrategy("MACD 策略 (黃金交叉買)", "MACD 柱狀圖由負轉正(黃金交叉)時買進，由正轉負時平倉", evalDates, evalPrices, runMACDLogic(prices)[startIndex:]))
+	results = append(results, simulateStrategy("KD 策略 (低檔黃金交叉買)", "K、D 皆小於 30 且 K 突破 D 時買進，皆大於 70 且 K 跌破 D 時平倉", evalDates, evalPrices, runKDLogic(prices, highs, lows)[startIndex:]))
+	results = append(results, simulateStrategy("Bollinger Bands (跌破下軌買)", "收盤價跌破布林通道下軌時買進，突破上軌時平倉", evalDates, evalPrices, runBollingerLogic(prices)[startIndex:]))
+	results = append(results, simulateStrategy("Momentum 動能策略", "10 日動能指標由負轉正時買進，由正轉負時平倉", evalDates, evalPrices, runMomentumLogic(prices)[startIndex:]))
+	results = append(results, simulateStrategy("ChipRatio 籌碼集中策略", "10 日均量比值大於 0.5 時買進，小於 0.5 時平倉", evalDates, evalPrices, runChipRatioLogic(prices)[startIndex:]))
+	
+	summary := BacktestSummary{
+		StockId:   stockID, // 寫入標準轉換代號
+		StockName: stockName,
+		Labels:    evalDates,
+		Prices:    evalPrices,
+		Results:   results,
+	}
+
+	return summary, nil
+}
+
+// =========================================================
+// 核心真實爬蟲與輔助運算函式庫
+// =========================================================
+
+// getBaseTradingDate 獲取合適的基準交易日。
+// 解決本地系統時間與證交所伺服器資料庫時間不同步的問題。
+// 優先向 TWSE 請求「伺服器端最新有交易紀錄的日期」，確保抓取歷史資料絕對不落空。
+func getBaseTradingDate() string {
+	// 1. 首選：直接向 TWSE 請求最新大盤指數狀態，獲取證交所資料庫的「最新真實交易日」
+	resp, err := httpGetWithRetry("https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=IND")
+	if err == nil {
+		defer resp.Body.Close()
+		var result map[string]interface{}
+		if json.NewDecoder(resp.Body).Decode(&result) == nil {
+			if dateStr, ok := result["date"].(string); ok && len(dateStr) == 8 {
+				// 回傳格式如 "20240419"
+				return dateStr 
+			}
+		}
+	}
+
+	// 2. 備援方案：嘗試從 TWSE OpenAPI 獲取
+	resp2, err2 := httpGetWithRetry("https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK")
+	if err2 == nil {
+		defer resp2.Body.Close()
+		var data []map[string]interface{}
+		body, _ := ioutil.ReadAll(resp2.Body)
+		if json.Unmarshal(body, &data) == nil && len(data) > 0 {
+			lastItem := data[len(data)-1]
+			twDateStr := fmt.Sprintf("%v", lastItem["Date"])
+			if len(twDateStr) == 7 { // e.g. "1130517" 代表 113年5月17日
+				if y, err := strconv.Atoi(twDateStr[0:3]); err == nil {
+					return fmt.Sprintf("%04d%s", y+1911, twDateStr[3:7])
+				}
+			}
+		}
+	} else if resp2 != nil {
+		resp2.Body.Close()
+	}
+
+	// 3. 最後的 Fallback：若網路完全異常，才使用本地系統時間
+	now := time.Now()
+	if now.Hour() < 15 { now = now.AddDate(0, 0, -1) }
+	for now.Weekday() == time.Sunday || now.Weekday() == time.Saturday { now = now.AddDate(0, 0, -1) }
+	return now.Format("20060102")
+}
+
+func previousDate(dateStr string) string {
+	t, err := time.Parse("20060102", dateStr)
+	if err != nil { return dateStr }
+	t = t.AddDate(0, 0, -1)
+	if t.Weekday() == time.Saturday { t = t.AddDate(0, 0, -1) }
+	if t.Weekday() == time.Sunday { t = t.AddDate(0, 0, -2) }
+	return t.Format("20060102")
+}
+
+func fetchPEAndPBFromTWSEOpenAPI(stockID string) (float64, float64, error) {
+	resp, err := httpGetWithRetry("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL")
+	if err == nil {
+		defer resp.Body.Close()
+		var data []map[string]interface{}
+		body, _ := ioutil.ReadAll(resp.Body)
+		if json.Unmarshal(body, &data) == nil {
+			for _, item := range data {
+				if item["Code"] == stockID {
+					pe, _ := strconv.ParseFloat(fmt.Sprintf("%v", item["PEratio"]), 64)
+					pb, _ := strconv.ParseFloat(fmt.Sprintf("%v", item["PBratio"]), 64)
+					return pe, pb, nil
+				}
+			}
+		}
+	}
+
+	respOtc, errOtc := httpGetWithRetry("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_perwibugf")
+	if errOtc == nil {
+		defer respOtc.Body.Close()
+		var dataOtc []map[string]interface{}
+		bodyOtc, _ := ioutil.ReadAll(respOtc.Body)
+		if json.Unmarshal(bodyOtc, &dataOtc) == nil {
+			for _, item := range dataOtc {
+				if item["SecuritiesCompanyCode"] == stockID {
+					pe, _ := strconv.ParseFloat(fmt.Sprintf("%v", item["PriceEarningRatio"]), 64)
+					pb, _ := strconv.ParseFloat(fmt.Sprintf("%v", item["PriceBookRatio"]), 64)
+					return pe, pb, nil
+				}
+			}
+		}
+	}
+	
+	return 0, 0, fmt.Errorf("OpenAPI 查無資料")
+}
+
+// extractTPExData 智慧提取 TPEx Web API 多變的 JSON 陣列格式 (相容新舊版的 aaData, data, tables 結構)
+func extractTPExData(result map[string]interface{}) []interface{} {
+	if aaData, ok := result["aaData"].([]interface{}); ok {
+		return aaData
+	}
+	if data, ok := result["data"].([]interface{}); ok {
+		return data
+	}
+	if tables, ok := result["tables"].([]interface{}); ok {
+		for _, tb := range tables {
+			if tableMap, ok := tb.(map[string]interface{}); ok {
+				if data, ok := tableMap["data"].([]interface{}); ok {
+					return data
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// fetchInstitutional 爬取單日個股的「三大法人」進出張數。
+// 優先從 TWSE 獲取，若找不到則無縫 fallback 至 TPEx Web API，並在日期迴圈中層層查找。
+// 回傳：外資買賣超張數、投信買賣超張數、自營商買賣超張數、三大法人總合計張數。
+func fetchInstitutional(stockID, currentDate string) (int, int, int, int) {
+	date := currentDate
+	for i := 0; i < 4; i++ {
+		url := fmt.Sprintf("https://www.twse.com.tw/fund/T86?response=json&date=%s&selectType=ALL", date)
+		resp, err := httpGetWithRetry(url)
+		if err == nil {
+			var result map[string]interface{}
+			json.NewDecoder(resp.Body).Decode(&result)
+			resp.Body.Close()
+			if dataList, ok := result["data"].([]interface{}); ok {
+				for _, item := range dataList {
+					row := item.([]interface{})
+					if strings.TrimSpace(fmt.Sprintf("%v", row[0])) == stockID {
+						f, _ := strconv.Atoi(strings.ReplaceAll(fmt.Sprintf("%v", row[4]), ",", ""))
+						i, _ := strconv.Atoi(strings.ReplaceAll(fmt.Sprintf("%v", row[7]), ",", ""))
+						d, _ := strconv.Atoi(strings.ReplaceAll(fmt.Sprintf("%v", row[11]), ",", ""))
+						return f/1000, i/1000, d/1000, (f+i+d)/1000
+					}
+				}
+			}
+		}
+
+		// 嘗試 TPEx (上櫃) Web API
+		y, _ := strconv.Atoi(date[0:4])
+		rocDate := fmt.Sprintf("%d/%s/%s", y-1911, date[4:6], date[6:8])
+		urlTPEx := fmt.Sprintf("https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&t=D&d=%s", rocDate)
+		respTPEx, errTPEx := httpGetWithRetry(urlTPEx)
+		if errTPEx == nil {
+			var result map[string]interface{}
+			if json.NewDecoder(respTPEx.Body).Decode(&result) == nil {
+				if targetData := extractTPExData(result); targetData != nil {
+					for _, item := range targetData {
+						row := item.([]interface{})
+						if len(row) >= 10 && fmt.Sprintf("%v", row[0]) == stockID {
+							var f, inv, d int
+							if len(row) >= 19 {
+								fStr := strings.ReplaceAll(fmt.Sprintf("%v", row[8]), ",", "")
+								f, _ = strconv.Atoi(fStr)
+								iStr := strings.ReplaceAll(fmt.Sprintf("%v", row[11]), ",", "")
+								inv, _ = strconv.Atoi(iStr)
+								dStr := strings.ReplaceAll(fmt.Sprintf("%v", row[18]), ",", "")
+								d, _ = strconv.Atoi(dStr)
+							} else if len(row) >= 11 {
+								fStr := strings.ReplaceAll(fmt.Sprintf("%v", row[4]), ",", "")
+								f, _ = strconv.Atoi(fStr)
+								iStr := strings.ReplaceAll(fmt.Sprintf("%v", row[7]), ",", "")
+								inv, _ = strconv.Atoi(iStr)
+								dStr := strings.ReplaceAll(fmt.Sprintf("%v", row[10]), ",", "")
+								d, _ = strconv.Atoi(dStr)
+							}
+							respTPEx.Body.Close()
+							return f/1000, inv/1000, d/1000, (f+inv+d)/1000
+						}
+					}
+				}
+			}
+			respTPEx.Body.Close()
+		}
+		date = previousDate(date)
+	}
+	return 0,0,0,0
+}
+
+func fetchDayTradingForStock(stockID, currentDate string) float64 {
+	date := currentDate
+	for i := 0; i < 4; i++ {
+		url := fmt.Sprintf("https://www.twse.com.tw/exchangeReport/TWTB4U?response=csv&date=%s", date)
+		resp, err := httpGetWithRetry(url)
+		if err == nil {
+			utf8Reader := transform.NewReader(resp.Body, traditionalchinese.Big5.NewDecoder())
+			utf8Data, _ := ioutil.ReadAll(utf8Reader)
+			resp.Body.Close()
+			lines := strings.Split(string(utf8Data), "\n")
+			reader := csv.NewReader(strings.NewReader(strings.Join(lines, "\n")))
+			reader.LazyQuotes = true
+			reader.FieldsPerRecord = -1
+			if records, err := reader.ReadAll(); err == nil {
+				for _, fields := range records {
+					if len(fields) >= 4 && strings.TrimSpace(strings.ReplaceAll(fields[0], "\"", "")) == stockID {
+						raw := strings.ReplaceAll(fields[3], "\"", "")
+						vol, _ := strconv.ParseFloat(strings.ReplaceAll(raw, ",", ""), 64)
+						return vol
+					}
+				}
+			}
+		}
+
+		// 嘗試 TPEx (上櫃) 當沖 Web API
+		y, _ := strconv.Atoi(date[0:4])
+		rocDate := fmt.Sprintf("%d/%s/%s", y-1911, date[4:6], date[6:8])
+		urlTPEx := fmt.Sprintf("https://www.tpex.org.tw/web/stock/trading/intraday_stat/intraday_trading_stat_result.php?l=zh-tw&o=json&d=%s", rocDate)
+		respTPEx, errTPEx := httpGetWithRetry(urlTPEx)
+		if errTPEx == nil {
+			var result map[string]interface{}
+			if json.NewDecoder(respTPEx.Body).Decode(&result) == nil {
+				if targetData := extractTPExData(result); targetData != nil {
+					for _, item := range targetData {
+						row := item.([]interface{})
+						if len(row) >= 4 && fmt.Sprintf("%v", row[0]) == stockID {
+							volStr := strings.ReplaceAll(fmt.Sprintf("%v", row[3]), ",", "")
+							vol, _ := strconv.ParseFloat(volStr, 64)
+							respTPEx.Body.Close()
+							return vol * 1000 
+						}
+					}
+				}
+			}
+			respTPEx.Body.Close()
+		}
+		date = previousDate(date)
+	}
+	return 0
+}
+
+func fetchDailyTotalVolume(stockID, currentDate string) float64 {
+	queryMonth := currentDate[:6] + "01"
+	url := fmt.Sprintf("https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=csv&date=%s&stockNo=%s", queryMonth, stockID)
+	resp, err := httpGetWithRetry(url)
+	if err == nil {
+		defer resp.Body.Close()
+		reader := transform.NewReader(resp.Body, traditionalchinese.Big5.NewDecoder())
+		utf8Data, _ := ioutil.ReadAll(reader)
+		lines := strings.Split(string(utf8Data), "\n")
+		
+		for i := len(lines) - 1; i >= 0; i-- {
+			line := strings.TrimSpace(lines[i])
+			if !strings.Contains(line, "/") { continue }
+			r := csv.NewReader(strings.NewReader(line))
+			r.LazyQuotes = true
+			r.FieldsPerRecord = -1
+			records, err := r.Read()
+			if err != nil || len(records) < 2 { continue }
+			
+			twParts := strings.Split(strings.TrimSpace(records[0]), "/")
+			if len(twParts) == 3 {
+				vol, _ := strconv.ParseFloat(strings.ReplaceAll(strings.ReplaceAll(records[1], ",", ""), "\"", ""), 64)
+				return vol
+			}
+		}
+	}
+
+	// 嘗試 TPEx (上櫃) 個股日成交資訊 Web API
+	y, _ := strconv.Atoi(currentDate[0:4])
+	rocMonth := fmt.Sprintf("%d/%s", y-1911, currentDate[4:6])
+	urlTPEx := fmt.Sprintf("https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&o=json&d=%s&stkno=%s", rocMonth, stockID)
+	respTPEx, errTPEx := httpGetWithRetry(urlTPEx)
+	if errTPEx == nil {
+		defer respTPEx.Body.Close()
+		var result map[string]interface{}
+		if json.NewDecoder(respTPEx.Body).Decode(&result) == nil {
+			if targetData := extractTPExData(result); targetData != nil {
+				for i := len(targetData) - 1; i >= 0; i-- {
+					row := targetData[i].([]interface{})
+					if len(row) >= 2 {
+						volStr := strings.ReplaceAll(fmt.Sprintf("%v", row[1]), ",", "")
+						vol, _ := strconv.ParseFloat(volStr, 64)
+						return vol * 1000 
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func fetchTotalShares(stockID string) float64 {
+	resp, err := httpGetWithRetry("https://openapi.twse.com.tw/v1/opendata/t187ap03_L")
+	if err != nil { return 0 }
+	defer resp.Body.Close()
+	var data []map[string]interface{}
+	body, _ := ioutil.ReadAll(resp.Body)
+	json.Unmarshal(body, &data)
+	for _, company := range data {
+		if company["公司代號"] == stockID {
+			capital, _ := strconv.ParseFloat(company["實收資本額"].(string), 64)
+			return capital / 10
+		}
+	}
+	return 0
+}
+
+func safeDivide(n, d float64) float64 {
+	if d == 0 { return 0 }
+	return (n / d) * 100
+}
+
+func fetchAdvancedMarginData(stockID, currentDate string) (MarginDetail, error) {
+	var detail MarginDetail
+	detail.TrendEvals = []string{}
+	date := currentDate
+	
+	var debugLogs []string // 專門收集死因的 Logger
+
+	for i := 0; i < 4; i++ { // 回推最多 4 天，避開假期的資料空窗期
+		// ================= 1. 嘗試 TWSE (上市) =================
+		url := fmt.Sprintf("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date=%s&selectType=ALL&response=csv", date)
+		resp, err := httpGetWithRetry(url)
+		if err != nil {
+			debugLogs = append(debugLogs, fmt.Sprintf("TWSE(%s)連線失敗", date))
+		} else {
+			utf8Reader := transform.NewReader(resp.Body, traditionalchinese.Big5.NewDecoder())
+			utf8Data, _ := ioutil.ReadAll(utf8Reader)
+			resp.Body.Close()
+			lines := strings.Split(string(utf8Data), "\n")
+			reader := csv.NewReader(strings.NewReader(strings.Join(lines, "\n")))
+			reader.LazyQuotes = true
+			reader.FieldsPerRecord = -1
+			
+			if records, err := reader.ReadAll(); err == nil {
+				foundTWSE := false
+				for _, fields := range records {
+					if len(fields) > 13 {
+						id := strings.ReplaceAll(fields[0], "\"", "")
+						id = strings.ReplaceAll(id, "=", "")
+						id = strings.TrimSpace(id)
+						
+						if id == stockID {
+							foundTWSE = true
+							parseF := func(s string) float64 {
+								v, _ := parseFinancialNumber(s)
+								return v 
+							}
+							
+							detail.FinBuy = parseF(fields[2])
+							detail.FinSell = parseF(fields[3])
+							detail.FinCashRepay = parseF(fields[4])
+							detail.FinPrevBalance = parseF(fields[5])
+							detail.FinCurrentBalance = parseF(fields[6])
+							detail.FinQuota = parseF(fields[7])
+							
+							detail.SecBuy = parseF(fields[8])
+							detail.SecSell = parseF(fields[9])
+							detail.SecStockRepay = parseF(fields[10])
+							detail.SecPrevBalance = parseF(fields[11])
+							detail.SecCurrentBalance = parseF(fields[12])
+							detail.SecQuota = parseF(fields[13])
+
+							detail.FinUsage = safeDivide(detail.FinCurrentBalance, detail.FinQuota)
+							detail.SecUsage = safeDivide(detail.SecCurrentBalance, detail.SecQuota)
+							detail.FinChangeRate = safeDivide(detail.FinCurrentBalance-detail.FinPrevBalance, detail.FinPrevBalance)
+							detail.SecChangeRate = safeDivide(detail.SecCurrentBalance-detail.SecPrevBalance, detail.SecPrevBalance)
+
+							if detail.FinCurrentBalance > 0 { 
+								detail.MarginShortRatio = (detail.SecCurrentBalance / detail.FinCurrentBalance) * 100 
+							} else {
+								detail.MarginShortRatio = 0
+							}
+							
+							detail.SqueezeForce = detail.FinChangeRate - detail.SecChangeRate
+
+							detail.FiveDayAvgShort = detail.SecPrevBalance
+							if detail.FiveDayAvgShort > 0 {
+								detail.ShortSqueezeStr = safeDivide(detail.FiveDayAvgShort-detail.SecCurrentBalance, detail.FiveDayAvgShort)
+							} else {
+								detail.ShortSqueezeStr = 0
+							}
+
+							if detail.SecCurrentBalance == 0 {
+								detail.TrendEvals = append(detail.TrendEvals, "⚠️ 融券餘額為 0，市場無做空籌碼，券資比極低")
+							} else if detail.SecUsage > 80 { 
+								detail.TrendEvals = append(detail.TrendEvals, "⚠️ 融券使用率 > 80%，看空情緒極端濃厚，隨時可能『軋空』") 
+							} else if detail.SecUsage > 50 { 
+								detail.TrendEvals = append(detail.TrendEvals, "📉 融券使用率 50~80%，市場偏空") 
+							} else { 
+								detail.TrendEvals = append(detail.TrendEvals, "🔄 融券使用率 < 50%，市場看空力道不強") 
+							}
+							
+							if detail.SqueezeForce > 10 {
+								detail.SqueezeEval = "🚀 >10，市場多方動能強，可能觸發軋空行情！"
+							} else if detail.SqueezeForce > 5 {
+								detail.SqueezeEval = "📈 5~10，市場多方動能增強，股價可能上漲"
+							} else if detail.SqueezeForce > -5 {
+								detail.SqueezeEval = "🔄 -5~5，多空力量均衡，市場相對穩定"
+							} else if detail.SqueezeForce > -10 {
+								detail.SqueezeEval = "📉 -10~-5，空方力量增強，股價可能承壓"
+							} else {
+								detail.SqueezeEval = "⚠️ <-10，市場空方動能強，可能發生多殺多風險！"
+							}
+							
+							if detail.ShortSqueezeStr >= 100 {
+								detail.ShortSqueezeEval = "🚀 100% 空單全數回補，軋空完畢！"
+							} else if detail.ShortSqueezeStr > 20 {
+								detail.ShortSqueezeEval = "🚀 > 20，有明顯軋空行情，股價可能快速拉升！"
+							} else if detail.ShortSqueezeStr > 10 {
+								detail.ShortSqueezeEval = "📈 > 10，可能有部分軋空力道"
+							} else {
+								detail.ShortSqueezeEval = "🔄 空單回補不明顯"
+							}
+
+							return detail, nil
+						}
+					}
+				}
+				if !foundTWSE {
+					debugLogs = append(debugLogs, fmt.Sprintf("TWSE(%s)無此代號", date))
+				}
+			} else {
+				debugLogs = append(debugLogs, fmt.Sprintf("TWSE(%s)CSV解析失敗", date))
+			}
+		}
+
+		// ================= 2. 嘗試 TPEx (上櫃) =================
+		y, _ := strconv.Atoi(date[0:4])
+		rocDate := fmt.Sprintf("%d/%s/%s", y-1911, date[4:6], date[6:8])
+		urlTPEx := fmt.Sprintf("https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json&d=%s", rocDate)
+		respTPEx, errTPEx := httpGetWithRetry(urlTPEx)
+		if errTPEx != nil {
+			debugLogs = append(debugLogs, fmt.Sprintf("TPEx(%s)連線阻擋", rocDate))
+		} else {
+			var result map[string]interface{}
+			if errJson := json.NewDecoder(respTPEx.Body).Decode(&result); errJson != nil {
+				debugLogs = append(debugLogs, fmt.Sprintf("TPEx(%s)格式異常(非JSON)", rocDate))
+			} else {
+				targetData := extractTPExData(result)
+
+				if targetData != nil {
+					if len(targetData) == 0 {
+						debugLogs = append(debugLogs, fmt.Sprintf("TPEx(%s)空資料(未結算)", rocDate))
+					} else {
+						foundTPEx := false
+						for _, item := range targetData {
+							row := item.([]interface{})
+							if len(row) >= 14 && fmt.Sprintf("%v", row[0]) == stockID {
+								foundTPEx = true
+								parseF := func(s interface{}) float64 {
+									v, _ := parseFinancialNumber(fmt.Sprintf("%v", s))
+									return v
+								}
+								
+								detail.FinPrevBalance = parseF(row[2])
+								detail.FinBuy = parseF(row[3])
+								detail.FinSell = parseF(row[4])
+								detail.FinCashRepay = parseF(row[5])
+								detail.FinCurrentBalance = parseF(row[6])
+								detail.FinQuota = parseF(row[7])
+
+								detail.SecPrevBalance = parseF(row[8])
+								detail.SecBuy = parseF(row[9])
+								detail.SecSell = parseF(row[10])
+								detail.SecStockRepay = parseF(row[11])
+								detail.SecCurrentBalance = parseF(row[12])
+								detail.SecQuota = parseF(row[13])
+
+								detail.FinUsage = safeDivide(detail.FinCurrentBalance, detail.FinQuota)
+								detail.SecUsage = safeDivide(detail.SecCurrentBalance, detail.SecQuota)
+								detail.FinChangeRate = safeDivide(detail.FinCurrentBalance-detail.FinPrevBalance, detail.FinPrevBalance)
+								detail.SecChangeRate = safeDivide(detail.SecCurrentBalance-detail.SecPrevBalance, detail.SecPrevBalance)
+
+								if detail.FinCurrentBalance > 0 { 
+									detail.MarginShortRatio = (detail.SecCurrentBalance / detail.FinCurrentBalance) * 100 
+								} else {
+									detail.MarginShortRatio = 0
+								}
+								
+								detail.SqueezeForce = detail.FinChangeRate - detail.SecChangeRate
+
+								detail.FiveDayAvgShort = detail.SecPrevBalance
+								if detail.FiveDayAvgShort > 0 {
+									detail.ShortSqueezeStr = safeDivide(detail.FiveDayAvgShort-detail.SecCurrentBalance, detail.FiveDayAvgShort)
+								} else {
+									detail.ShortSqueezeStr = 0
+								}
+
+								if detail.SecCurrentBalance == 0 {
+									detail.TrendEvals = append(detail.TrendEvals, "⚠️ 融券餘額為 0，市場無做空籌碼，券資比極低")
+								} else if detail.SecUsage > 80 { 
+									detail.TrendEvals = append(detail.TrendEvals, "⚠️ 融券使用率 > 80%，看空情緒極端濃厚，隨時可能『軋空』") 
+								} else if detail.SecUsage > 50 { 
+									detail.TrendEvals = append(detail.TrendEvals, "📉 融券使用率 50~80%，市場偏空") 
+								} else { 
+									detail.TrendEvals = append(detail.TrendEvals, "🔄 融券使用率 < 50%，市場看空力道不強") 
+								}
+								
+								if detail.SqueezeForce > 10 {
+									detail.SqueezeEval = "🚀 >10，市場多方動能強，可能觸發軋空行情！"
+								} else if detail.SqueezeForce > 5 {
+									detail.SqueezeEval = "📈 5~10，市場多方動能增強，股價可能上漲"
+								} else if detail.SqueezeForce > -5 {
+									detail.SqueezeEval = "🔄 -5~5，多空力量均衡，市場相對穩定"
+								} else if detail.SqueezeForce > -10 {
+									detail.SqueezeEval = "📉 -10~-5，空方力量增強，股價可能承壓"
+								} else {
+									detail.SqueezeEval = "⚠️ <-10，市場空方動能強，可能發生多殺多風險！"
+								}
+								
+								if detail.ShortSqueezeStr >= 100 {
+									detail.ShortSqueezeEval = "🚀 100% 空單全數回補，軋空完畢！"
+								} else if detail.ShortSqueezeStr > 20 {
+									detail.ShortSqueezeEval = "🚀 > 20，有明顯軋空行情，股價可能快速拉升！"
+								} else if detail.ShortSqueezeStr > 10 {
+									detail.ShortSqueezeEval = "📈 > 10，可能有部分軋空力道"
+								} else {
+									detail.ShortSqueezeEval = "🔄 空單回補不明顯"
+								}
+
+								respTPEx.Body.Close()
+								return detail, nil
+							}
+						}
+						if !foundTPEx {
+							debugLogs = append(debugLogs, fmt.Sprintf("TPEx(%s)查無此股", rocDate))
+						}
+					}
+				} else {
+					if total, ok := result["iTotalRecords"].(float64); ok && total == 0 {
+						debugLogs = append(debugLogs, fmt.Sprintf("TPEx(%s)無資料(未結算)", rocDate))
+					} else {
+						debugLogs = append(debugLogs, fmt.Sprintf("TPEx(%s)缺資料欄位", rocDate))
+					}
+				}
+			}
+			respTPEx.Body.Close()
+		}
+
+		date = previousDate(date)
+	}
+
+	// 若連找 4 天全部失敗，將追蹤日誌轉為 Error 拋給前端
+	return detail, fmt.Errorf("%s", strings.Join(debugLogs, " | "))
+}
+
+func fetchLargeShareholders(stockID string) (float64, float64, bool) {
+	mirrors := []string{
+		"fubon-ebrokerdj.fbs.com.tw",
+		"djinfo.cathaysec.com.tw",
+		"stock.capital.com.tw",
+	}
+
+	for _, mirror := range mirrors {
+		djUrl := fmt.Sprintf("https://%s/z/zc/zck/zck_%s.djhtm", mirror, stockID)
+		respDj, errDj := httpGetWithRetry(djUrl)
+		if errDj != nil { continue }
+		
+		utf8Reader := transform.NewReader(respDj.Body, traditionalchinese.Big5.NewDecoder())
+		utf8Data, errRead := ioutil.ReadAll(utf8Reader)
+		respDj.Body.Close()
+		if errRead != nil { continue }
+
+		html := strings.ToLower(string(utf8Data))
+		rows := strings.Split(html, "<tr")
+		for _, row := range rows {
+			cells := extractCells(row)
+			if len(cells) < 8 { continue } 
+
+			dateIdx := -1
+			for i := 0; i < 3 && i < len(cells); i++ {
+				if strings.Contains(cells[i], "/") && strings.ContainsAny(cells[i], "0123456789") && len(cells[i]) >= 5 {
+					dateIdx = i
+					break
+				}
+			}
+
+			if dateIdx != -1 && len(cells) >= dateIdx+9 {
+				val400, err1 := parseFinancialNumber(cells[dateIdx+2])
+				val1000, err2 := parseFinancialNumber(cells[dateIdx+8])
+
+				if err1 == nil && err2 == nil && val400 > 0 {
+					return val1000, val400, true
+				}
+			}
+		}
+	}
+
+	hiUrl := fmt.Sprintf("https://histock.tw/stock/chip.aspx?no=%s&m=mg", stockID)
+	respHi, errHi := httpGetWithRetry(hiUrl)
+	if errHi == nil {
+		defer respHi.Body.Close()
+		bytes, _ := ioutil.ReadAll(respHi.Body)
+		html := strings.ToLower(string(bytes))
+		
+		rows := strings.Split(html, "<tr")
+		for _, row := range rows {
+			cells := extractCells(row)
+			if len(cells) >= 8 {
+				dateIdx := -1
+				for i := 0; i < 3 && i < len(cells); i++ {
+					if strings.Contains(cells[i], "/") && strings.ContainsAny(cells[i], "0123456789") && len(cells[i]) >= 5 {
+						dateIdx = i
+						break
+					}
+				}
+
+				if dateIdx != -1 && len(cells) >= dateIdx+9 {
+					val400, e1 := parseFinancialNumber(cells[dateIdx+2])
+					val1000, e2 := parseFinancialNumber(cells[dateIdx+8])
+					if e1 == nil && e2 == nil && val400 > 0 {
+						return val1000, val400, true
+					}
+				}
+			}
+		}
+	}
+
+	startDate := "2024-01-01" 
+	finmindUrl := fmt.Sprintf("https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockHoldingSharesPer&data_id=%s&start_date=%s", stockID, startDate)
+	respFm, errFm := httpGetWithRetry(finmindUrl)
+	
+	if errFm == nil {
+		defer respFm.Body.Close()
+		var result struct {
+			Status int `json:"status"`
+			Data []map[string]interface{} `json:"data"`
+		}
+		body, _ := ioutil.ReadAll(respFm.Body)
+		if json.Unmarshal(body, &result) == nil && len(result.Data) > 0 {
+			type Hold struct { L float64; S float64 }
+			dm := make(map[string]*Hold)
+			
+			for _, item := range result.Data {
+				dateStr := fmt.Sprintf("%v", item["date"])
+				if dm[dateStr] == nil { dm[dateStr] = &Hold{} }
+				
+				levelStr := strings.ReplaceAll(fmt.Sprintf("%v", item["HoldingSharesLevel"]), ",", "")
+				levelStr = strings.ReplaceAll(levelStr, " ", "")
+				
+				isLarge := strings.Contains(levelStr, "400001") || strings.Contains(levelStr, "600001") || 
+				           strings.Contains(levelStr, "800001") || strings.Contains(levelStr, "1000001") ||
+				           levelStr == "12" || levelStr == "13" || levelStr == "14" || levelStr == "15"
+				isSuper := strings.Contains(levelStr, "1000001") || levelStr == "15"
+				
+				percent, _ := strconv.ParseFloat(fmt.Sprintf("%v", item["percent"]), 64)
+
+				if isLarge { dm[dateStr].L += percent }
+				if isSuper { dm[dateStr].S += percent }
+			}
+			
+			var dates []string
+			for d := range dm { dates = append(dates, d) }
+			sort.Sort(sort.Reverse(sort.StringSlice(dates)))
+			
+			if len(dates) > 0 {
+				latest := dates[0]
+				return dm[latest].S, dm[latest].L, true
+			}
+		}
+	}
+	
+	fileName := "tdcc_cache.csv"
+	info, errStat := os.Stat(fileName)
+	
+	// 若本地快取檔案不存在，或已超過 12 小時的時效，則重新從集保下載
+	if os.IsNotExist(errStat) || time.Since(info.ModTime()) > 12*time.Hour {
+		tdccResp, tdccErr := httpGetWithRetry("https://smart.tdcc.com.tw/opendata/getOD.ashx?id=1-5")
+		if tdccErr == nil {
+			defer tdccResp.Body.Close()
+			bodyBytes, _ := ioutil.ReadAll(tdccResp.Body)
+			ioutil.WriteFile(fileName, bodyBytes, 0644)
+		}
+	}
+
+	file, errOpen := os.Open(fileName)
+	if errOpen == nil {
+		defer file.Close()
+		scanner := bufio.NewScanner(file)
+		var tdccLargeRatio, tdccSuperRatio float64
+		found := false
+
+		scanner.Scan()
+		
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" { continue }
+			
+			parts := strings.Split(line, ",")
+			if len(parts) < 6 { continue }
+
+			id := strings.ReplaceAll(parts[1], "\"", "")
+			id = strings.ReplaceAll(id, "=", "")
+			id = strings.TrimSpace(id)
+
+			if id == stockID {
+				found = true
+				levelStr := strings.ReplaceAll(parts[2], "\"", "")
+				levelStr = strings.ReplaceAll(levelStr, "=", "")
+				level, _ := strconv.Atoi(strings.TrimSpace(levelStr))
+
+				percentStr := strings.ReplaceAll(parts[5], "\"", "")
+				percentStr = strings.ReplaceAll(percentStr, "=", "")
+				percentStr = strings.ReplaceAll(percentStr, "%", "")
+				percent, _ := parseFinancialNumber(percentStr)
+
+				if level >= 12 && level <= 15 { tdccLargeRatio += percent }
+				if level == 15 { tdccSuperRatio += percent }
+			}
+		}
+		if found { 
+			return tdccSuperRatio, tdccLargeRatio, false 
+		}
+	}
+	
+	return 0, 0, false
+}
+
+// =========================================================
+// 回測策略演算法
+// =========================================================
+
+// simulateStrategy 回測引擎核心。
+// 接收歷史日期與對應價格，以及各策略產生出來的「進出訊號陣列 (signals)」，
+// 依據訊號 (1 為買進、-1 為賣出) 模擬資金 $1,000,000 的動態交易狀況，
+// 最終計算並回傳總結報告 (累積報酬、最大回撤、勝率等) 與逐筆交易明細紀錄。
+func simulateStrategy(name string, desc string, dates []string, prices []float64, signals []int) BacktestResult {
+	initialCapital := 1000000.0
+	capital := initialCapital
+	position := 0.0
+	maxCapital, minCapital := capital, capital
+	winTrades, totalTrades := 0, 0
+	buyPrice := 0.0
+
+	var trades []TradeRecord
+
+	for i, signal := range signals {
+		price := prices[i]
+		date := dates[i]
+
+		if signal == 1 && position == 0 { 
+			sharesToBuy := math.Floor((capital * 0.95) / price)
+			if sharesToBuy > 0 { 
+				position = sharesToBuy 
+				capital -= sharesToBuy * price 
+				buyPrice = price 
+				
+				trades = append(trades, TradeRecord{Date: date, Action: "買進", Price: price, Shares: sharesToBuy, Capital: capital, Profit: 0})
+			}
+		} else if signal == -1 && position > 0 { 
+			profit := (price - buyPrice) * position
+			capital += position * price
+			
+			trades = append(trades, TradeRecord{Date: date, Action: "賣出", Price: price, Shares: position, Capital: capital, Profit: profit})
+			
+			position = 0
+			totalTrades++
+			if price > buyPrice { winTrades++ }
+		}
+		
+		curr := capital + (position * price)
+		if curr > maxCapital { maxCapital = curr }
+		if curr < minCapital { minCapital = curr }
+	}
+	
+	final := capital + (position * prices[len(prices)-1])
+	ret := ((final - initialCapital) / initialCapital) * 100
+	mdd := ((maxCapital - minCapital) / maxCapital) * 100
+	wr := 0.0
+	if totalTrades > 0 { wr = (float64(winTrades) / float64(totalTrades)) * 100 }
+	
+	return BacktestResult{
+		Strategy:     name,
+		Description:  desc, 
+		TotalReturn:  math.Round(ret*100)/100, 
+		MaxDrawdown:  math.Round(mdd*100)/100, 
+		WinRate:      math.Round(wr*100)/100, 
+		FinalCapital: math.Round(final),
+		Trades:       trades, 
+	}
+}
+
+// runRSILogic 實作 RSI 回測策略。
+// 計算最近 14 日的平均上漲幅與平均下跌幅得出 RSI，
+// 買進條件：RSI 跌破 30 後產生買入訊號；賣出條件：RSI 突破 70 後平倉。
+func runRSILogic(prices []float64) []int {
+	signals := make([]int, len(prices))
+	if len(prices) < 14 { return signals }
+	for i := 14; i < len(prices); i++ {
+		u, d := 0.0, 0.0
+		for j := i - 13; j <= i; j++ { if diff := prices[j] - prices[j-1]; diff > 0 { u += diff } else { d -= diff } }
+		rs := 100.0
+		if d != 0 { rs = (u/14) / (d/14) }
+		rsi := 100.0 - (100.0 / (1.0 + rs))
+		if rsi < 30 { signals[i] = 1 } else if rsi > 70 { signals[i] = -1 }
+	}
+	return signals
+}
+
+// runSMALogic 實作 SMA (20日均線) 突破策略。
+// 買進條件：當日收盤價向上穿越突破 20 日移動平均線；賣出條件：收盤價跌破 20 日均線。
+func runSMALogic(prices []float64) []int {
+	signals := make([]int, len(prices))
+	if len(prices) < 20 { return signals }
+	for i := 20; i < len(prices); i++ {
+		sum := 0.0
+		for j := i - 19; j <= i; j++ { sum += prices[j] }
+		sma := sum / 20.0
+		if prices[i] > sma && prices[i-1] <= sma { signals[i] = 1 } else if prices[i] < sma && prices[i-1] >= sma { signals[i] = -1 }
+	}
+	return signals
+}
+
+// runMACDLogic 實作 MACD (平滑異同移動平均線) 策略。
+// 利用 12EMA 與 26EMA 計算差離值(DIF)，再得出 9 日 MACD 柱狀圖。
+// 買進條件：MACD 柱狀圖由負轉正(黃金交叉)；賣出條件：柱狀圖由正轉負。
+func runMACDLogic(prices []float64) []int {
+	signals := make([]int, len(prices))
+	if len(prices) < 35 { return signals }
+	e12, e26 := prices[0], prices[0]
+	var difs []float64
+	for i := 0; i < len(prices); i++ {
+		e12, e26 = (prices[i]*2+e12*11)/13, (prices[i]*2+e26*25)/27
+		difs = append(difs, e12-e26)
+	}
+	macd := difs[0]
+	for i := 0; i < len(prices); i++ {
+		macd = (difs[i]*2+macd*8)/10
+		if i > 0 {
+			pMacd := (difs[i-1]*2+macd*8)/10
+			if difs[i] > macd && difs[i-1] <= pMacd { signals[i] = 1 } else if difs[i] < macd && difs[i-1] >= pMacd { signals[i] = -1 }
+		}
+	}
+	return signals
+}
+
+// runKDLogic 實作隨機指標 KD 策略。
+// 計算最近 9 日的 RSV 值，並平滑出 K 值與 D 值。
+// 買進條件：K 突破 D 且數值皆處於低檔 (<30)；賣出條件：K 跌破 D 且數值皆處於高檔 (>70)。
+func runKDLogic(prices, highs, lows []float64) []int {
+	signals := make([]int, len(prices))
+	if len(prices) < 9 { return signals }
+	k, d := 50.0, 50.0
+	for i := 8; i < len(prices); i++ {
+		hi, lo := highs[i], lows[i]
+		for j := i - 8; j <= i; j++ { if highs[j] > hi { hi = highs[j] }; if lows[j] < lo { lo = lows[j] } }
+		rsv := 50.0
+		if hi != lo { rsv = 100 * (prices[i] - lo) / (hi - lo) }
+		pK, pD := k, d
+		k, d = (2.0/3.0)*pK+(1.0/3.0)*rsv, (2.0/3.0)*pD+(1.0/3.0)*k
+		if k > d && pK <= pD && k < 30 { signals[i] = 1 } else if k < d && pK >= pD && k > 70 { signals[i] = -1 }
+	}
+	return signals
+}
+
+// runBollingerLogic 實作布林通道 (Bollinger Bands) 策略。
+// 依據 20 日均線及 2 倍標準差繪製上下軌。
+// 買進條件：價格跌破下軌視為超賣買進；賣出條件：價格突破上軌視為超買平倉。
+func runBollingerLogic(prices []float64) []int {
+	period := 20
+	signals := make([]int, len(prices))
+	if len(prices) < period { return signals }
+	for i := period - 1; i < len(prices); i++ {
+		sum := 0.0
+		for j := i - period + 1; j <= i; j++ { sum += prices[j] }
+		sma := sum / float64(period)
+		sumSquares := 0.0
+		for j := i - period + 1; j <= i; j++ {
+			diff := prices[j] - sma
+			sumSquares += diff * diff
+		}
+		stdDev := math.Sqrt(sumSquares / float64(period))
+		upperBand, lowerBand := sma+2*stdDev, sma-2*stdDev
+		if prices[i] < lowerBand { signals[i] = 1 } else if prices[i] > upperBand { signals[i] = -1 }
+	}
+	return signals
+}
+
+// runMomentumLogic 實作動能指標策略。
+// 計算當日價格與 10 日前的價格差異作為動能值。
+// 買進條件：動能指標由負轉正；賣出條件：動能指標由正轉負。
+func runMomentumLogic(prices []float64) []int {
+	period := 10
+	signals := make([]int, len(prices))
+	if len(prices) < period { return signals }
+	for i := period; i < len(prices); i++ {
+		momentum := prices[i] - prices[i-period]
+		if momentum > 0 { signals[i] = 1 } else if momentum < 0 { signals[i] = -1 }
+	}
+	return signals
+}
+
+// runChipRatioLogic 實作簡易的量價集中比率策略。
+// 計算今日收盤價佔近 10 日均值的比例。
+// 買進條件：比值突破 0.5 (相對強勢)；賣出條件：比值跌破 0.5 (相對弱勢)。
+func runChipRatioLogic(prices []float64) []int {
+	period := 10
+	signals := make([]int, len(prices))
+	if len(prices) < period { return signals }
+	for i := period; i < len(prices); i++ {
+		sum := 0.0
+		for j := i - period + 1; j <= i; j++ { sum += prices[j] }
+		chipRatio := prices[i] / (sum / float64(period))
+		if chipRatio > 0.5 { signals[i] = 1 } else if chipRatio < 0.5 { signals[i] = -1 }
+	}
+	return signals
+}
