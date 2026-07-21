@@ -1,0 +1,1070 @@
+import React, { useState, useEffect } from 'react';
+import { 
+  Search, TrendingUp, TrendingDown, Users, Briefcase, 
+  Activity, BarChart3, PieChart, Zap, Trophy, Download, Play, Save,
+  ShieldCheck, AlertTriangle, ChevronRight, ChevronDown,
+  Target, Minus, Square, X, CalendarClock,
+  Eye, Trash2, Plus
+} from 'lucide-react';
+
+// @ts-ignore
+import { EventsOn } from "../wailsjs/runtime/runtime";
+
+// =========================================================
+// TypeScript 型別定義 (對應後端資料結構)
+// =========================================================
+interface Top10Stock { 
+  indicator: string; 
+  id: string; 
+  name: string; 
+  price: string; 
+  change?: string;
+  feature: string; 
+}
+interface EPSDetail { q: string; v: number; }
+interface BasicInfo { 
+  pe: string; 
+  pb: string; 
+  roe: string; 
+  eps: string; 
+  epsQuarters?: string; 
+  epsDetails?: EPSDetail[]; 
+  assessment: string; 
+}
+interface InstitutionalData { foreign: number; investment: number; dealer: number; total: number; }
+
+interface MarginDetail {
+  finBuy: number; finSell: number; finCashRepay: number;
+  finPrevBalance: number; finCurrentBalance: number; finQuota: number;
+  finUsage: number; finChangeRate: number;
+  secBuy: number; secSell: number; secStockRepay: number;
+  secPrevBalance: number; secCurrentBalance: number; secQuota: number;
+  secUsage: number; secChangeRate: number;
+  fiveDayAvgShort: number; marginShortRatio: number;
+  squeezeForce: number; shortSqueezeStr: number;
+  trendEvals: string[]; squeezeEval: string; shortSqueezeEval: string;
+}
+
+interface RetailData { 
+  dayTradeRatio: number; 
+  marginShortRatio: number; 
+  squeezeForce: number; 
+  shortSqueezeStrength: number; 
+  sentiment: string; 
+  detail: MarginDetail;
+}
+
+interface ChipsData { 
+  majorForceRatio: number; 
+  concentration: string; 
+  turnoverRate: number; 
+}
+
+interface StockAnalysisResult { stockId: string; stockName: string; date: string; trend: string; basic: BasicInfo; institutional: InstitutionalData; retail: RetailData; chips: ChipsData; errorMsg?: string; }
+
+interface TradeRecord {
+  date: string;
+  action: string;
+  price: number;
+  shares: number;
+  capital: number;
+  profit: number;
+}
+
+interface BacktestResult { 
+  strategy: string; 
+  description: string; 
+  totalReturn: number; 
+  maxDrawdown: number; 
+  winRate: number; 
+  finalCapital: number; 
+  trades: TradeRecord[]; 
+}
+
+interface BacktestSummary {
+  stockId: string; 
+  stockName: string;
+  labels: string[];
+  prices: number[];
+  results: BacktestResult[];
+}
+
+interface WatchlistItem {
+  id: string;
+  name: string;
+  addDate: string;
+  addPrice: number;
+}
+
+// ✨ 新增後端對應的動態數據結構
+interface WatchlistStat {
+  currentPrice: number;
+  basePrice: number; // 🎯 新增此行
+  highestPrice: number;
+  highestGain: number;
+  elapsedDays: number;
+  totalTradingDays: number;
+}
+
+declare global {
+  interface Window {
+    go: { main: { App: {
+          FetchTop10FromCloud: () => Promise<Top10Stock[]>;
+          ExportMarketData: () => Promise<string>;
+          FetchStockAnalysis: (input: string) => Promise<StockAnalysisResult>;
+          DownloadStockHistory: (input: string) => Promise<string>;
+          RunBacktest: (input: string, months: number) => Promise<BacktestSummary>;
+          FetchNBreakout: () => Promise<Top10Stock[]>;
+          LoadWatchlist: () => Promise<WatchlistItem[]>;
+          SaveWatchlist: (list: WatchlistItem[]) => Promise<void>;
+          // ✨ 已經將 GetCurrentPrices 替換為 GetWatchlistStats
+          GetWatchlistStats: (items: WatchlistItem[]) => Promise<Record<string, WatchlistStat>>;
+    }; }; };
+    // 確保 Wails runtime 的定義與結尾括號完整保留
+    runtime: { WindowMinimise: () => void; WindowToggleMaximise: () => void; Quit: () => void; };
+  }
+}
+
+// ✨ 進階升級：將 PriceChart 移出 App 元件外，避免 React 每次渲染都重新卸載並掛載此元件
+const PriceChart = ({ labels, prices }: { labels: string[], prices: number[] }) => {
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+
+  if (!prices || prices.length === 0 || !labels || labels.length === 0) return null;
+  const minPrice = Math.min(...prices);
+  const maxPrice = Math.max(...prices);
+  const range = maxPrice - minPrice || 1;
+  const padding = range * 0.1;
+  const adjustedMin = minPrice - padding;
+  const adjustedMax = maxPrice + padding;
+  const adjustedRange = adjustedMax - adjustedMin || 1;
+
+  const width = 800;
+  const height = 200;
+
+  const points = prices.map((price, i) => {
+    const x = (i / (prices.length - 1)) * width;
+    const y = height - ((price - adjustedMin) / adjustedRange) * height;
+    return `${x},${y}`;
+  }).join(' ');
+
+  const areaPoints = `0,${height} ${points} ${width},${height}`;
+
+  // 自動計算 6 個平均分佈的時間刻度
+  const labelCount = Math.min(labels.length, 6);
+  const axisData = [];
+  for (let i = 0; i < labelCount; i++) {
+    const idx = Math.floor(i * (labels.length - 1) / (labelCount - 1));
+    axisData.push({
+      idx: idx,
+      xPct: (idx / (labels.length - 1)) * 100, 
+      text: labels[idx] ? labels[idx].replace(/-/g, '/') : '' 
+    });
+  }
+
+  // 處理滑鼠懸浮事件 (取得最靠近的數據點)
+  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const ratio = x / rect.width;
+    let idx = Math.round(ratio * (prices.length - 1));
+    if (idx < 0) idx = 0;
+    if (idx >= prices.length) idx = prices.length - 1;
+    setHoverIdx(idx);
+  };
+
+  const handleMouseLeave = () => setHoverIdx(null);
+
+  // 依據百分比動態計算 Tooltip 的平移基準，防止左右邊緣(不論是前幾天)溢出畫面
+  let tooltipTransform = 'translate(-50%, -10px)';
+  if (hoverIdx !== null) {
+    const currentXPct = (hoverIdx / (prices.length - 1)) * 100;
+    if (currentXPct < 15) {
+      tooltipTransform = 'translate(10px, -10px)';
+    } else if (currentXPct > 85) {
+      tooltipTransform = 'translate(calc(-100% - 10px), -10px)';
+    }
+  }
+
+  return (
+    <div className="w-full h-72 bg-slate-900/60 rounded-2xl border border-slate-700/50 p-5 pb-6 flex flex-col relative shadow-inner mb-2">
+      {/* 標題與極值 */}
+      <div className="absolute top-4 left-6 text-slate-300 text-sm font-bold flex items-center gap-2 z-10 pointer-events-none">
+          <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block animate-pulse"></span> 區間還原股價走勢
+      </div>
+      <div className="absolute top-4 right-6 text-emerald-400 text-sm font-bold z-10 pointer-events-none">最高: {maxPrice.toFixed(2)}</div>
+      <div className="absolute bottom-12 right-6 text-rose-400 text-sm font-bold z-10 pointer-events-none">最低: {minPrice.toFixed(2)}</div>
+      
+      <div className="flex-1 mt-6 relative group">
+        <svg 
+          viewBox={`0 0 ${width} ${height}`} 
+          className="w-full h-full preserve-3d cursor-crosshair overflow-visible" 
+          preserveAspectRatio="none"
+          onMouseMove={handleMouseMove}
+          onMouseLeave={handleMouseLeave}
+        >
+          <defs>
+            <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#10b981" stopOpacity="0.4" />
+              <stop offset="100%" stopColor="#10b981" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+
+          {/* 繪製對應日期的垂直輔助網格線 */}
+          {axisData.map((item, i) => {
+            const xPos = (item.idx / (labels.length - 1)) * width;
+            return (
+              <line
+                key={`grid-${i}`}
+                x1={xPos} y1="0" x2={xPos} y2={height}
+                stroke="#334155" strokeWidth="1.5" strokeDasharray="4 4"
+                opacity="0.6"
+              />
+            );
+          })}
+
+          {/* 繪製股價曲線 */}
+          <polygon points={areaPoints} fill="url(#chartGradient)" className="transition-opacity duration-300 group-hover:opacity-75" />
+          <polyline points={points} fill="none" stroke="#10b981" strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+          
+          {/* 互動式浮動準星與錨點 */}
+          {hoverIdx !== null && (
+            <>
+              <line
+                x1={(hoverIdx / (prices.length - 1)) * width}
+                y1={0}
+                x2={(hoverIdx / (prices.length - 1)) * width}
+                y2={height}
+                stroke="#94a3b8"
+                strokeWidth="1.5"
+                strokeDasharray="4 4"
+                className="pointer-events-none"
+              />
+              <circle
+                cx={(hoverIdx / (prices.length - 1)) * width}
+                cy={height - ((prices[hoverIdx] - adjustedMin) / adjustedRange) * height}
+                r={5}
+                fill="#10b981"
+                stroke="#ffffff"
+                strokeWidth={2}
+                className="pointer-events-none drop-shadow-md"
+              />
+            </>
+          )}
+        </svg>
+
+        {/* 懸浮 Tooltip */}
+        {hoverIdx !== null && (
+          <div 
+            className="absolute pointer-events-none z-20 bg-slate-800/95 backdrop-blur-sm border border-slate-600 shadow-xl rounded-xl p-3 flex flex-col gap-1 transition-all duration-75 ease-out"
+            style={{
+              top: '0px',
+              left: `${(hoverIdx / (prices.length - 1)) * 100}%`,
+              transform: tooltipTransform
+            }}
+          >
+            <div className="text-slate-400 text-xs font-bold uppercase tracking-wider">{labels[hoverIdx]}</div>
+            <div className="text-emerald-400 font-mono text-xl font-black">${prices[hoverIdx].toFixed(2)}</div>
+          </div>
+        )}
+      </div>
+
+      {/* 動態渲染 X 軸日期標籤 (年/月/日) */}
+      <div className="relative h-6 mt-3 border-t border-slate-700/50 w-full text-xs text-slate-400 font-mono pointer-events-none">
+        {axisData.map((item, i) => {
+          let positionClass = "transform -translate-x-1/2";
+          let style: React.CSSProperties = { left: `${item.xPct}%` };
+
+          if (i === 0) {
+            positionClass = "text-left";
+            style = { left: "0%" };
+          } else if (i === axisData.length - 1) {
+            positionClass = "text-right transform -translate-x-full";
+            style = { left: "100%" };
+          }
+
+          return (
+            <div key={`label-${i}`} className={`absolute top-2 ${positionClass} whitespace-nowrap`} style={style}>
+              {item.text}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+const App: React.FC = () => {
+    
+    // 🎯 1. 修正核心：所有的 React Hooks 必須放在元件最頂端！
+    const [appState, setAppState] = useState<'checking' | 'downloading' | 'ready'>('checking');
+    const [activeTab, setActiveTab] = useState<'market' | 'nBreakout' | 'analysis' | 'backtest' | 'watchlist'>('market');
+
+    const [top10Stocks, setTop10Stocks] = useState<Top10Stock[]>([]);
+    const [loadingMarket, setLoadingMarket] = useState(false);
+    const [marketMsg, setMarketMsg] = useState(''); 
+
+    const [nBreakoutStocks, setNBreakoutStocks] = useState<Top10Stock[]>([]);
+    const [loadingNBreakout, setLoadingNBreakout] = useState(false);
+    const [nBreakoutMsg, setNBreakoutMsg] = useState('');
+
+    const [stockCode, setStockCode] = useState('');
+    const [loadingAnalysis, setLoadingAnalysis] = useState(false);
+    const [analysisData, setAnalysisData] = useState<StockAnalysisResult | null>(null);
+    const [showDetails, setShowDetails] = useState(false);
+
+    const [backtestCode, setBacktestCode] = useState('');
+    const [backtestPeriod, setBacktestPeriod] = useState<number>(12);
+    const [loadingBacktest, setLoadingBacktest] = useState(false);
+    const [backtestMsg, setBacktestMsg] = useState('');
+    const [backtestResults, setBacktestResults] = useState<BacktestResult[]>([]);
+    const [backtestSummary, setBacktestSummary] = useState<BacktestSummary | null>(null);
+
+    const [expandedRow, setExpandedRow] = useState<number | null>(null);
+
+    // 觀察清單狀態
+    const [watchlist, setWatchlist] = useState<WatchlistItem[]>([]);
+    // ✨ 修改：從 Record<string, number> 變為 Record<string, WatchlistStat>
+    const [watchlistStats, setWatchlistStats] = useState<Record<string, WatchlistStat>>({});
+    const [loadingWatchlist, setLoadingWatchlist] = useState(false);
+    const [toastMsg, setToastMsg] = useState<{text: string, type: 'success' | 'error'} | null>(null);
+	
+    // 🎯 2. 監聽後端的啟動檢查事件
+    useEffect(() => {
+        EventsOn("download_required", () => setAppState('downloading'));
+        EventsOn("data_ready", () => setAppState('ready'));
+    }, []);
+
+    const showToast = (text: string, type: 'success' | 'error' = 'success') => {
+      setToastMsg({text, type});
+      setTimeout(() => setToastMsg(null), 3000);
+    }
+
+    const loadTop10 = async () => {
+      setLoadingMarket(true); setMarketMsg('');
+      try { setTop10Stocks(await window.go.main.App.FetchTop10FromCloud()); setMarketMsg('✅ 雲端資料同步完成'); } 
+      catch (err: any) { setMarketMsg(`❌ ${err}`); } finally { setLoadingMarket(false); }
+    };
+
+    const exportAllData = async () => {
+      setLoadingMarket(true); setMarketMsg('');
+      try { setMarketMsg(await window.go.main.App.ExportMarketData()); } 
+      catch (err: any) { setMarketMsg(`❌ ${err}`); } finally { setLoadingMarket(false); }
+    };
+
+    const loadNBreakout = async () => {
+      setLoadingNBreakout(true);
+      setNBreakoutMsg('⏳ 正在執行全市場 N 字型動能與量價背離掃描，需分析近百檔股票，請稍候...');
+      try {
+        const results = await window.go.main.App.FetchNBreakout();
+        setNBreakoutStocks(results || []);
+        if (results && results.length > 0) {
+          setNBreakoutMsg('✅ 掃描完成！已篩選出全市場最具爆發力的 N 字型突破個股');
+        } else {
+          setNBreakoutMsg('⚠️ 掃描完成！但目前市場無符合強勢 N 字型突破條件的個股');
+        }
+      } catch (err: any) {
+        setNBreakoutMsg(`❌ 掃描失敗: ${err}`);
+      } finally {
+        setLoadingNBreakout(false);
+      }
+    };
+
+    const handleAnalyze = async (e: React.FormEvent) => {
+      e.preventDefault(); if (!stockCode.trim()) return;
+      setLoadingAnalysis(true); setShowDetails(false);
+      try { setAnalysisData(await window.go.main.App.FetchStockAnalysis(stockCode)); } 
+      catch (err: any) { console.error("分析失敗:", err); } finally { setLoadingAnalysis(false); }
+    };
+
+    const handleDownloadHistory = async () => {
+      if (!backtestCode.trim()) return;
+      setLoadingBacktest(true); setBacktestMsg('⏳ 下載歷史資料，需約 15-20 秒防擋延遲...'); setBacktestResults([]); setBacktestSummary(null); setExpandedRow(null);
+      try { setBacktestMsg(await window.go.main.App.DownloadStockHistory(backtestCode)); } 
+      catch (err: any) { setBacktestMsg(`❌ 下載失敗: ${err}`); } finally { setLoadingBacktest(false); }
+    };
+
+    const handleRunBacktest = async () => {
+      if (!backtestCode.trim()) return;
+      setLoadingBacktest(true); setBacktestMsg(`⚙️ 正在根據選定區間 (${backtestPeriod} 個月) 進行策略回測...`); setExpandedRow(null); setBacktestSummary(null);
+      try {
+        const summary = await window.go.main.App.RunBacktest(backtestCode, backtestPeriod);
+        setBacktestSummary(summary);
+        setBacktestResults(summary.results);
+        setBacktestMsg(`✅ 回測執行完畢！(區間：近 ${backtestPeriod} 個月，初始資金：$1,000,000)`);
+      } catch (err: any) { setBacktestMsg(`❌ 回測失敗: ${err}`); } finally { setLoadingBacktest(false); }
+    };
+
+    // 觀察清單相關處理
+    const loadWatchlistData = async () => {
+      setLoadingWatchlist(true);
+      try {
+        const list = await window.go.main.App.LoadWatchlist();
+        setWatchlist(list);
+        if (list.length > 0) {
+          // ✨ 修改：呼叫新的後端函式，傳入整個 list 進行分析
+          const stats = await window.go.main.App.GetWatchlistStats(list);
+          setWatchlistStats(stats);
+        }
+      } catch (err) {
+        console.error("載入觀察清單失敗", err);
+      } finally {
+        setLoadingWatchlist(false);
+      }
+    };
+
+    const handleAddToWatchlist = async (stock: Top10Stock) => {
+      try {
+        const list = await window.go.main.App.LoadWatchlist();
+        if (list.find(item => item.id === stock.id)) {
+          showToast(`${stock.name} 已經在觀察清單中！`, 'error');
+          return;
+        }
+        const newItem: WatchlistItem = {
+          id: stock.id,
+          name: stock.name,
+          addDate: new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\//g, '-'),
+          addPrice: parseFloat(stock.price.replace(/[^0-9.-]/g, '')) || 0,
+        };
+        const newList = [...list, newItem];
+        await window.go.main.App.SaveWatchlist(newList);
+        showToast(`✅ 已將 ${stock.name} 加入專屬觀察清單！`);
+      } catch (err) {
+        showToast('加入觀察清單失敗', 'error');
+        console.error("加入觀察清單失敗", err);
+      }
+    };
+
+    const removeFromWatchlist = async (id: string) => {
+      try {
+        const newList = watchlist.filter(item => item.id !== id);
+        await window.go.main.App.SaveWatchlist(newList);
+        setWatchlist(newList);
+        showToast('已成功從觀察清單移除', 'success');
+      } catch (err) {
+        showToast('移除失敗', 'error');
+      }
+    };
+
+    const getColor = (num: number) => num > 0 ? 'text-rose-500' : num < 0 ? 'text-emerald-500' : 'text-slate-400';
+    const formatNumberWithSign = (num: number) => num > 0 ? `+${num.toLocaleString()}` : num.toLocaleString();
+
+    const getRowPriceColor = (s: Top10Stock) => {
+      const changeStr = s.change || '';
+      const priceStr = s.price || '';
+      
+      if (changeStr.includes('+') || changeStr.includes('▲') || priceStr.includes('▲')) return 'text-rose-500';
+      if (changeStr.includes('-') || changeStr.includes('▼') || priceStr.includes('▼')) return 'text-emerald-500';
+      
+      const changeVal = parseFloat(changeStr.replace(/[^0-9.-]/g, ''));
+      if (!isNaN(changeVal) && changeStr.trim() !== '') {
+          if (changeVal > 0) return 'text-rose-500';
+          if (changeVal < 0) return 'text-emerald-500';
+      }
+      return 'text-white';
+    };
+
+    const groupedStocks = top10Stocks.reduce((acc, stock) => {
+      if (!acc[stock.indicator]) acc[stock.indicator] = [];
+      acc[stock.indicator].push(stock); return acc;
+    }, {} as Record<string, Top10Stock[]>);
+
+    // 🎯 3. 攔截畫面 (必須放在所有 Hooks 宣告完畢之後，此處原本是舊的 PriceChart 位置)
+    if (appState === 'checking') {
+        return (
+            <div className="flex flex-col items-center justify-center min-h-screen bg-slate-900 text-slate-200">
+                <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mb-4"></div>
+                <h2 className="text-xl font-bold tracking-wider">系統啟動中</h2>
+                <p className="text-sm text-slate-400 mt-2">正在檢查環境變數與核心數據庫...</p>
+            </div>
+        );
+    }
+
+    // 攔截畫面 (強制下載 80MB 資料中)
+    if (appState === 'downloading') {
+        return (
+            <div className="flex flex-col items-center justify-center min-h-screen bg-slate-900 text-slate-200 relative overflow-hidden">
+                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-64 h-64 bg-blue-600 rounded-full blur-[100px] opacity-20 animate-pulse"></div>
+                <div className="bg-slate-800 p-8 rounded-2xl shadow-2xl border border-slate-700 max-w-md w-full z-10 text-center">
+                    <svg className="w-16 h-16 text-blue-500 mx-auto mb-6 animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                    </svg>
+                    <h2 className="text-2xl font-bold mb-2">更新核心籌碼資料庫</h2>
+                    <p className="text-slate-400 text-sm mb-6">
+                        系統偵測到缺失近期的集保大數據檔案，正在從伺服器拉取資料（約 80MB）。<br/>
+                        <span className="text-amber-400 block mt-2">請耐心等候，下載完成後將自動進入系統...</span>
+                    </p>
+                    <div className="w-full h-2 bg-slate-700 rounded-full overflow-hidden relative">
+                        <div className="absolute top-0 left-0 h-full bg-blue-500 w-1/3 animate-[translateX_2s_ease-in-out_infinite]" style={{ animation: 'translateX 1.5s infinite alternate' }}></div>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+  return (
+    <div className="flex flex-col h-screen bg-[#070B14] text-slate-300 font-sans overflow-hidden selection:bg-cyan-500/30">
+      
+      {/* 🚀 系統視窗控制列 */}
+      <div style={{ '--wails-draggable': 'drag' } as React.CSSProperties} className="h-10 bg-[#04080F] flex items-center justify-between px-4 border-b border-slate-800/80 z-50 shrink-0 select-none">
+        <div className="flex items-center gap-2 text-cyan-500/60"><Target size={14} /><span className="text-xs font-black tracking-[0.2em]">QUANT DESKTOP TERMINAL</span></div>
+        <div style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties} className="flex items-center gap-2">
+          <button onClick={() => window.runtime?.WindowMinimise()} className="p-1.5 text-slate-500 hover:text-cyan-400 hover:bg-slate-800/50 rounded-lg transition-all"><Minus size={16} strokeWidth={2.5} /></button>
+          <button onClick={() => window.runtime?.WindowToggleMaximise()} className="p-1.5 text-slate-500 hover:text-cyan-400 hover:bg-slate-800/50 rounded-lg transition-all"><Square size={13} strokeWidth={2.5} /></button>
+          <button onClick={() => window.runtime?.Quit()} className="p-1.5 text-slate-500 hover:text-white hover:bg-rose-500 rounded-lg transition-all"><X size={16} strokeWidth={2.5} /></button>
+        </div>
+      </div>
+
+      {/* 系統吐司通知 (Toast) */}
+      {toastMsg && (
+        <div className={`fixed top-16 right-8 z-[100] px-6 py-3 rounded-xl shadow-2xl border font-bold flex items-center gap-3 animate-in slide-in-from-top-4 fade-in duration-300 ${toastMsg.type === 'success' ? 'bg-emerald-900/90 border-emerald-500/50 text-emerald-100' : 'bg-rose-900/90 border-rose-500/50 text-rose-100'}`}>
+          {toastMsg.type === 'success' ? <ShieldCheck size={20} /> : <AlertTriangle size={20} />}
+          {toastMsg.text}
+        </div>
+      )}
+
+      <div className="flex flex-1 overflow-hidden relative">
+        {/* 左側導航 */}
+        <nav className="w-64 bg-slate-900/40 backdrop-blur-xl border-r border-slate-800 flex flex-col pt-6 z-10 shadow-xl shrink-0">
+          <h2 className="text-2xl font-black text-center mb-8 flex items-center justify-center gap-2 text-cyan-400 tracking-wider"><Activity size={28} /> Q-Desktop</h2>
+          <div className="flex flex-col gap-2 px-4">
+            <button onClick={() => setActiveTab('market')} className={`flex items-center gap-3 px-4 py-4 rounded-xl font-bold transition-all duration-300 ${activeTab === 'market' ? 'bg-cyan-600/20 text-cyan-400 border border-cyan-500/30' : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'}`}><Trophy size={20} /> 大盤與潛力股</button>
+            <button onClick={() => setActiveTab('nBreakout')} className={`flex items-center gap-3 px-4 py-4 rounded-xl font-bold transition-all duration-300 ${activeTab === 'nBreakout' ? 'bg-orange-600/20 text-orange-400 border border-orange-500/30' : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'}`}><Zap size={20} /> N 字突破選股</button>
+            <button onClick={() => { setActiveTab('watchlist'); loadWatchlistData(); }} className={`flex items-center gap-3 px-4 py-4 rounded-xl font-bold transition-all duration-300 ${activeTab === 'watchlist' ? 'bg-purple-600/20 text-purple-400 border border-purple-500/30' : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'}`}><Eye size={20} /> 專屬觀察清單</button>
+            <button onClick={() => setActiveTab('analysis')} className={`flex items-center gap-3 px-4 py-4 rounded-xl font-bold transition-all duration-300 ${activeTab === 'analysis' ? 'bg-indigo-600/20 text-indigo-400 border border-indigo-500/30' : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'}`}><Search size={20} /> 個股深度診斷</button>
+            <button onClick={() => setActiveTab('backtest')} className={`flex items-center gap-3 px-4 py-4 rounded-xl font-bold transition-all duration-300 ${activeTab === 'backtest' ? 'bg-emerald-600/20 text-emerald-400 border border-emerald-500/30' : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'}`}><BarChart3 size={20} /> 策略歷史回測</button>
+          </div>
+        </nav>
+
+        {/* 主要畫面 */}
+        <main className="flex-1 overflow-y-auto p-8 relative scroll-smooth w-full">
+          <div className="absolute top-0 left-0 right-0 h-96 bg-gradient-to-b from-cyan-900/10 to-transparent pointer-events-none"></div>
+
+          {/* ======================= 分頁一：每日選股訊號池 ======================= */}
+          {activeTab === 'market' && (
+            <div className="w-full mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500 relative z-10">
+              <header className="mb-8 border-b border-slate-800/80 pb-6 flex justify-between items-end">
+                <h1 className="text-4xl font-black flex items-center gap-3 text-white tracking-tight"><Trophy className="text-cyan-400" size={32} /> 每日選股訊號池</h1>
+                <div className="flex gap-4">
+                  <button onClick={loadTop10} disabled={loadingMarket} className="flex items-center gap-2 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl font-bold disabled:opacity-50 transition-all"><Download size={20} /> 同步雲端數據</button>
+                  <button onClick={exportAllData} disabled={loadingMarket} className="flex items-center gap-2 px-6 py-3 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl border border-slate-700 disabled:opacity-50 transition-all"><Save size={20} /> 匯出 CSV</button>
+                </div>
+              </header>
+              {marketMsg && <div className={`mb-6 p-4 rounded-xl border flex items-center gap-3 text-lg font-medium backdrop-blur-md shadow-lg ${marketMsg.includes('❌') ? 'bg-rose-900/20 border-rose-800/50 text-rose-400' : 'bg-emerald-900/20 border-emerald-800/50 text-emerald-400'}`}>{marketMsg}</div>}
+              
+              <div className="bg-[#0B1121]/80 backdrop-blur-xl rounded-2xl overflow-hidden border border-slate-800/80 shadow-2xl">
+                <table className="w-full text-left">
+                  <thead className="bg-slate-900/80 border-b border-slate-800">
+                    <tr>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">股票代號 (點擊看走勢)</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">名稱</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">最新收盤價</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">AI 訊號解讀</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/50">
+                    {top10Stocks.length === 0 && !loadingMarket && <tr><td colSpan={5} className="p-16 text-center text-slate-600">系統待命中，請點擊上方「同步雲端數據」</td></tr>}
+                    {Object.entries(groupedStocks).map(([indicatorName, stocks]) => (
+                      <React.Fragment key={indicatorName}>
+                        <tr className="bg-slate-800/30"><td colSpan={5} className="px-5 py-3 border-l-4 border-cyan-500 text-cyan-400 font-black tracking-widest text-sm bg-gradient-to-r from-cyan-900/20 to-transparent">{indicatorName} 爆發潛力池</td></tr>
+                        {stocks.map((s, i) => (
+                          <tr key={`${indicatorName}-${i}`} className="hover:bg-slate-800/40 transition-colors group">
+                            <td className="p-5 pl-8">
+                              <a 
+                                href={`https://www.google.com/search?q=台股+${s.id}`} 
+                                target="_blank" 
+                                rel="noopener noreferrer" 
+                                className="font-mono font-bold text-cyan-400 text-lg hover:text-cyan-300 hover:underline inline-flex items-center gap-2 cursor-pointer transition-all"
+                                title="開啟 Google 查看走勢圖"
+                              >
+                                {s.id}
+                              </a>
+                            </td>
+                            <td className="p-5 text-slate-200 font-bold text-lg">{s.name}</td>
+                            <td className={`p-5 font-mono text-xl font-bold ${getRowPriceColor(s)}`}>{s.price}</td>
+                            <td className="p-5 text-slate-400">{s.feature}</td>
+                            <td className="p-5">
+                              <button onClick={() => handleAddToWatchlist(s)} className="text-sm px-4 py-2 bg-slate-800 border border-slate-700 hover:bg-purple-600 hover:border-purple-500 hover:text-white text-slate-300 rounded-xl transition-all flex items-center gap-2 font-bold shadow-sm">
+                                <Plus size={16} /> 觀察
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </React.Fragment>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ======================= 分頁二：N 字型突破選股 ======================= */}
+          {activeTab === 'nBreakout' && (
+            <div className="w-full mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500 relative z-10">
+              <header className="mb-8 border-b border-slate-800/80 pb-6 flex justify-between items-end">
+                <h1 className="text-4xl font-black flex items-center gap-3 text-white tracking-tight"><Zap className="text-orange-400" size={32} /> N 字突破潛力前十名</h1>
+                <div className="flex gap-4">
+                  <button onClick={loadNBreakout} disabled={loadingNBreakout} className="flex items-center gap-2 px-6 py-3 bg-orange-600 hover:bg-orange-500 text-white rounded-xl font-bold disabled:opacity-50 transition-all shadow-lg shadow-orange-900/20">
+                    <Play size={20} /> 執行全市場掃描
+                  </button>
+                </div>
+              </header>
+              {nBreakoutMsg && <div className={`mb-6 p-4 rounded-xl border flex items-center gap-3 text-lg font-medium backdrop-blur-md shadow-lg ${nBreakoutMsg.includes('❌') ? 'bg-rose-900/20 border-rose-800/50 text-rose-400' : 'bg-orange-900/20 border-orange-800/50 text-orange-400'}`}>{nBreakoutMsg}</div>}
+              
+              <div className="bg-[#0B1121]/80 backdrop-blur-xl rounded-2xl overflow-hidden border border-slate-800/80 shadow-2xl">
+                <table className="w-full text-left">
+                  <thead className="bg-slate-900/80 border-b border-slate-800">
+                    <tr>
+                      <th className="p-5 pl-8 text-slate-400 uppercase text-sm font-bold tracking-wider">潛力排名</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">股票代號</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">名稱</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">最新收盤價</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">型態特徵解讀</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/50">
+                    {nBreakoutStocks.length === 0 && !loadingNBreakout && <tr><td colSpan={6} className="p-16 text-center text-slate-600">系統待命中，請點擊上方「執行全市場掃描」</td></tr>}
+                    {nBreakoutStocks.map((s, i) => (
+                      <tr key={`nbreakout-${i}`} className="hover:bg-slate-800/40 transition-colors group">
+                        <td className="p-5 pl-8 font-mono font-black text-2xl text-orange-400">#{i + 1}</td>
+                        <td className="p-5">
+                          <a 
+                            href={`https://www.google.com/search?q=台股+${s.id}`} 
+                            target="_blank" 
+                            rel="noopener noreferrer" 
+                            className="font-mono font-bold text-orange-400 text-lg hover:text-orange-300 hover:underline inline-flex items-center gap-2 cursor-pointer transition-all"
+                            title="開啟 Google 查看走勢圖"
+                          >
+                            {s.id}
+                          </a>
+                        </td>
+                        <td className="p-5 text-slate-200 font-bold text-lg">{s.name}</td>
+                        <td className={`p-5 font-mono text-xl font-bold ${getRowPriceColor(s)}`}>{s.price}</td>
+                        <td className="p-5 text-slate-400">{s.feature}</td>
+                        <td className="p-5">
+                          <button onClick={() => handleAddToWatchlist(s)} className="text-sm px-4 py-2 bg-slate-800 border border-slate-700 hover:bg-purple-600 hover:border-purple-500 hover:text-white text-slate-300 rounded-xl transition-all flex items-center gap-2 font-bold shadow-sm">
+                            <Plus size={16} /> 觀察
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ======================= 分頁三：專屬觀察清單 ======================= */}
+          {activeTab === 'watchlist' && (
+            <div className="w-full mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500 relative z-10 pb-16">
+              <header className="mb-8 border-b border-slate-800/80 pb-6 flex justify-between items-end">
+                <h1 className="text-4xl font-black flex items-center gap-3 text-white tracking-tight"><Eye className="text-purple-400" size={32} /> 專屬觀察清單</h1>
+                <div className="flex gap-4">
+                  <button onClick={loadWatchlistData} disabled={loadingWatchlist} className="flex items-center gap-2 px-6 py-3 bg-purple-600 hover:bg-purple-500 text-white rounded-xl font-bold disabled:opacity-50 transition-all shadow-lg shadow-purple-900/20">
+                    <Activity size={20} /> 更新最新報價
+                  </button>
+                </div>
+              </header>
+
+              <div className="bg-[#0B1121]/80 backdrop-blur-xl rounded-2xl overflow-hidden border border-slate-800/80 shadow-2xl">
+                <table className="w-full text-left">
+                  <thead className="bg-slate-900/80 border-b border-slate-800">
+                    <tr>
+                      <th className="p-5 pl-8 text-slate-400 uppercase text-sm font-bold tracking-wider">股票代號</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">名稱</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">加入紀錄</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">加入時股價</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">最新股價</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider">至今績效 / 最高漲幅</th>
+                      <th className="p-5 text-slate-400 uppercase text-sm font-bold tracking-wider text-center">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/50">
+                    {loadingWatchlist && watchlist.length === 0 && (
+                      <tr><td colSpan={7} className="p-16 text-center text-slate-500 text-lg font-bold">載入清單與報價中...</td></tr>
+                    )}
+                    {!loadingWatchlist && watchlist.length === 0 && (
+                      <tr>
+                        <td colSpan={7} className="p-16 text-center text-slate-500">
+                           <div className="flex flex-col items-center gap-3">
+                             <Target size={48} className="text-slate-700" />
+                             <span className="text-lg">目前沒有觀察名單，請至「大盤與潛力股」或「N字突破選股」點擊加入</span>
+                           </div>
+                        </td>
+                      </tr>
+                    )}
+                    {watchlist.map((item) => {
+                      const stat = watchlistStats[item.id];
+                      const currentPrice = stat?.currentPrice || 0;
+                      
+                      // 🎯 核心修正：使用後端校正後的真實加入日收盤價，若無則退回 item.addPrice
+                      const basePrice = stat?.basePrice || item.addPrice;
+                      
+                      // 計算初步的至今績效
+                      let perf = basePrice > 0 && currentPrice > 0 ? ((currentPrice - basePrice) / basePrice) * 100 : 0;
+                      
+                      // 🎯 新增防護：消除浮點數運算的微小誤差
+                      // 只要漲跌幅不到 0.01% (例如 -0.00001% 或 0.00005%)，強制歸零
+                      if (Math.abs(perf) < 0.01) {
+                          perf = 0;
+                      }
+
+                      const perfStr = currentPrice > 0 ? perf.toFixed(2) + '%' : '計算中...';
+                      const perfColor = perf > 0 ? 'text-rose-500' : perf < 0 ? 'text-emerald-500' : 'text-slate-400';
+                      
+                      // 判斷是否為有效的高點 (過濾掉因浮點數誤差造成的 0.00%)
+                      const hasValidHigh = stat && stat.highestGain >= 0.01 && stat.elapsedDays >= 0;
+
+                      return (
+                        <tr key={item.id} className="hover:bg-slate-800/40 transition-colors group">
+                          <td className="p-5 pl-8">
+                            <a 
+                                href={`https://www.google.com/search?q=台股+${item.id}`} 
+                                target="_blank" 
+                                rel="noopener noreferrer" 
+                                className="font-mono font-bold text-purple-400 text-lg hover:text-purple-300 hover:underline transition-all inline-flex items-center gap-2"
+                              >
+                                {item.id}
+                              </a>
+                          </td>
+                          <td className="p-5 text-slate-200 font-bold text-lg">{item.name}</td>
+                          
+                          <td className="p-5 text-slate-400 font-mono tracking-wider">{item.addDate}</td>
+                          
+                          {/* 🎯 修改：加入時股價改顯示校正後的 basePrice */}
+                          <td className="p-5 font-mono text-xl text-slate-300">${basePrice.toFixed(2)}</td>
+                          <td className="p-5 font-mono text-xl font-bold text-white">
+                            {currentPrice > 0 ? `$${currentPrice.toFixed(2)}` : <span className="text-slate-600 animate-pulse">載入中</span>}
+                          </td>
+                          
+                          <td className="p-5">
+                            <div className="flex flex-col">
+                              <span className={`font-mono text-xl font-black ${currentPrice > 0 ? perfColor : 'text-slate-500'}`}>
+                                {currentPrice > 0 ? (perf > 0 ? `+${perfStr}` : perfStr) : perfStr}
+                              </span>
+                              <div className="flex items-center gap-2 mt-1">
+                                <span className="text-xs text-slate-500 font-bold whitespace-nowrap">區間最高:</span>
+                                {hasValidHigh ? (
+                                  <span className="text-xs font-mono font-bold text-rose-400/80 bg-rose-900/20 px-1.5 py-0.5 rounded border border-rose-800/50">
+                                    +{stat.highestGain.toFixed(2)}% (耗時 {stat.elapsedDays} 個交易日)
+                                  </span>
+                                ) : (
+                                  <span className="text-xs font-mono font-bold text-emerald-400/80 bg-emerald-900/20 px-1.5 py-0.5 rounded border border-emerald-800/50">
+                                    尚未獲利，目前經過 {stat?.totalTradingDays || 0} 個交易日
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+                          
+                          <td className="p-5 text-center">
+                            <button onClick={() => removeFromWatchlist(item.id)} className="p-2.5 text-slate-500 hover:text-rose-400 hover:bg-rose-900/30 rounded-xl transition-colors" title="移除追蹤">
+                              <Trash2 size={20} />
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ======================= 分頁四：個股深度診斷 ======================= */}
+          {activeTab === 'analysis' && (
+            <div className="w-full mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500 relative z-10 pb-16">
+              <form onSubmit={handleAnalyze} className={`relative flex gap-4 items-center transition-all duration-500 ${analysisData ? 'mb-8' : 'w-full max-w-3xl mx-auto mt-20'}`}>
+                <div className="relative flex-1 group">
+                  <div className="relative flex items-center bg-[#0F172A] border-2 border-slate-700/80 focus-within:border-indigo-500 rounded-2xl overflow-hidden transition-all">
+                    <Search className="text-indigo-400 ml-6" size={24} />
+                    <input type="text" value={stockCode} onChange={e => setStockCode(e.target.value)} placeholder="輸入台股名稱或代號 (如: 台積電 或 2330)" className="w-full bg-transparent px-6 py-5 text-2xl text-white font-mono placeholder-slate-600 focus:outline-none tracking-widest" />
+                  </div>
+                </div>
+                <button type="submit" disabled={loadingAnalysis} className="bg-indigo-600 hover:bg-indigo-500 text-white px-10 py-5 rounded-2xl font-black text-xl tracking-wider min-w-[140px] disabled:opacity-50 transition-all">{loadingAnalysis ? '掃描中...' : '執行掃描'}</button>
+              </form>
+
+              {analysisData && (
+                <div className="space-y-6 animate-in fade-in zoom-in-95 duration-500">
+                  <div className="bg-[#0B1121]/80 backdrop-blur-xl p-8 rounded-3xl border border-slate-800/80 shadow-2xl flex justify-between items-center gap-6">
+                    <div>
+                      <h2 className="text-5xl font-black text-white tracking-tight">
+                        <a 
+                          href={`https://www.google.com/search?q=台股+${analysisData.stockId}`} 
+                          target="_blank" 
+                          rel="noopener noreferrer" 
+                          className="flex items-baseline gap-4 hover:text-slate-200 hover:underline cursor-pointer transition-all group"
+                          title="開啟 Google 查看走勢圖"
+                        >
+                          {analysisData.stockName} <span className="text-3xl font-mono text-indigo-400 group-hover:text-indigo-300">{analysisData.stockId}</span>
+                        </a>
+                      </h2>
+                      <p className="text-slate-400 mt-2 text-lg"><Zap size={18} className="inline text-yellow-500"/> 最新交易日: {analysisData.date}</p>
+                    </div>
+                    <div className={`px-8 py-5 rounded-2xl border-2 flex items-center gap-3 text-2xl font-black shadow-lg backdrop-blur-md ${analysisData.trend.includes('多') ? 'bg-rose-950/40 border-rose-500/50 text-rose-400 shadow-[0_0_30px_rgba(244,63,94,0.2)]' : analysisData.trend.includes('空') ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-400 shadow-[0_0_30px_rgba(16,185,129,0.2)]' : 'bg-slate-800/80 border-slate-600 text-slate-300'}`}>
+                      {analysisData.trend.includes('多') ? <TrendingUp size={32} strokeWidth={3}/> : analysisData.trend.includes('空') ? <TrendingDown size={32} strokeWidth={3}/> : <Activity size={32}/>} 
+                      {analysisData.trend}
+                    </div>
+                  </div>
+
+                  {/* ✨ 補齊個股基本面診斷與全新 EPS 視覺排版區塊 */}
+                  <div className="bg-[#0B1121]/80 backdrop-blur-xl p-8 rounded-3xl border border-slate-800/80 shadow-2xl w-full">
+                      <h3 className="text-2xl font-black text-slate-200 mb-6 flex items-center gap-3"><Briefcase className="text-indigo-500" size={28}/> 個股基本面與估值診斷</h3>
+                      <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
+                          <div className="bg-slate-900/50 p-6 rounded-2xl border border-slate-700/50 flex flex-col items-center justify-center">
+                              <h4 className="text-slate-400 text-sm font-bold mb-2">本益比 (P/E)</h4>
+                              <p className={`text-3xl font-mono font-black ${analysisData.basic.pe === '負值(虧損)' ? 'text-rose-500' : 'text-indigo-400'}`}>{analysisData.basic.pe}</p>
+                          </div>
+                          <div className="bg-slate-900/50 p-6 rounded-2xl border border-slate-700/50 flex flex-col items-center justify-center">
+                              <h4 className="text-slate-400 text-sm font-bold mb-2">股價淨值比 (P/B)</h4>
+                              <p className="text-3xl font-mono font-black text-indigo-400">{analysisData.basic.pb}</p>
+                          </div>
+                          <div className="bg-slate-900/50 p-6 rounded-2xl border border-slate-700/50 flex flex-col items-center justify-center">
+                              <h4 className="text-slate-400 text-sm font-bold mb-2">推估股東權益報酬率 (ROE)</h4>
+                              <p className={`text-3xl font-mono font-black ${analysisData.basic.roe.includes('虧損') ? 'text-rose-500' : 'text-indigo-400'}`}>{analysisData.basic.roe}</p>
+                          </div>
+
+                          {/* ✨ 全新 EPS 列出式排版 */}
+                          <div className="bg-slate-900/50 p-6 rounded-2xl border border-slate-700/50 flex flex-col items-center justify-center relative w-full shadow-inner h-full min-h-[160px]">
+                              <h4 className="text-slate-300 text-sm font-black mb-4 border-b border-slate-700 pb-2 w-full text-center tracking-widest">近 4 季 EPS (真實財報)</h4>
+                              
+                              {analysisData.basic.epsDetails && analysisData.basic.epsDetails.length > 0 ? (
+                                  <div className="flex flex-col gap-2 w-full mb-4 flex-1 justify-center">
+                                      {analysisData.basic.epsDetails.map((detail, idx) => (
+                                          <div key={idx} className="flex justify-between items-center text-sm font-mono px-4 py-2 bg-slate-800/80 rounded-lg shadow-sm border border-slate-700/50">
+                                              <span className="text-slate-400 font-bold">{detail.q}</span>
+                                              <span className={detail.v > 0 ? 'text-emerald-400 font-bold' : detail.v < 0 ? 'text-rose-400 font-bold' : 'text-slate-400 font-bold'}>
+                                                  {detail.v > 0 ? '+' : ''}{detail.v.toFixed(2)}元
+                                              </span>
+                                          </div>
+                                      ))}
+                                  </div>
+                              ) : (
+                                  <div className="text-xs text-slate-500 my-auto font-mono font-bold tracking-tight text-center flex-1 flex flex-col items-center justify-center gap-2">
+                                      <span className="text-slate-400">{analysisData.basic.epsQuarters || '資料擷取中...'}</span>
+                                  </div>
+                              )}
+                              
+                              <div className="border-t border-slate-700 w-full pt-4 mt-auto flex justify-between items-center px-2">
+                                  <span className="text-slate-300 font-bold text-sm tracking-wider">近四季總和</span>
+                                  <p className={`text-3xl font-mono font-black ${analysisData.basic.eps === 'N/A' || analysisData.basic.eps.includes('虧損') ? 'text-rose-500' : 'text-emerald-400'}`}>
+                                      {analysisData.basic.eps !== '虧損' && analysisData.basic.eps !== 'N/A' && !analysisData.basic.eps.includes('虧損') ? `$${analysisData.basic.eps}` : analysisData.basic.eps}
+                                  </p>
+                              </div>
+                          </div>
+
+                      </div>
+                      <div className="p-4 rounded-xl border flex items-center gap-3 bg-indigo-900/20 border-indigo-800/50 text-indigo-300">
+                          <ShieldCheck size={20} className="shrink-0"/> 
+                          <span className="font-bold text-lg">系統綜合估值評估：{analysisData.basic.assessment}</span>
+                      </div>
+                  </div>
+
+                  <div className="bg-[#0B1121]/80 backdrop-blur-xl p-8 rounded-3xl border border-slate-800/80 shadow-2xl w-full">
+                      <h3 className="text-2xl font-black text-slate-200 mb-6 flex items-center gap-3"><ShieldCheck className="text-emerald-500" size={28}/> 系統綜合籌碼評估</h3>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                          <div className="bg-slate-900/50 p-6 rounded-2xl border border-slate-700/50"><h4 className="text-lg font-bold text-cyan-400 mb-3 border-b border-slate-700 pb-2 flex items-center gap-2"><Activity size={18}/>趨勢與資券評估</h4><ul className="space-y-2">{analysisData.retail.detail.trendEvals.map((t, i) => (<li key={i} className="text-slate-300">{t}</li>))}</ul></div>
+                          <div className="bg-slate-900/50 p-6 rounded-2xl border border-slate-700/50"><h4 className="text-lg font-bold text-rose-400 mb-3 border-b border-slate-700 pb-2 flex items-center gap-2"><AlertTriangle size={18}/>擠壓力道評估</h4><p className="text-slate-300">{analysisData.retail.detail.squeezeEval}</p></div>
+                          <div className="bg-slate-900/50 p-6 rounded-2xl border border-slate-700/50"><h4 className="text-lg font-bold text-amber-400 mb-3 border-b border-slate-700 pb-2 flex items-center gap-2"><TrendingUp size={18}/>軋空力道評估</h4><p className="text-slate-300">{analysisData.retail.detail.shortSqueezeEval}</p></div>
+                      </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <div className="bg-[#0B1121]/80 backdrop-blur-xl p-8 rounded-3xl border border-slate-800/80 shadow-2xl flex flex-col"><h3 className="text-xl font-black text-slate-200 mb-6 flex items-center gap-2"><Briefcase size={24} className="text-rose-500"/> 三大法人動向</h3><div className="space-y-5 text-lg flex-1"><div className="flex justify-between border-b border-slate-800/50 pb-2"><span className="text-slate-400">外資買賣超</span><span className={`font-mono font-black text-2xl ${getColor(analysisData.institutional.foreign)}`}>{formatNumberWithSign(analysisData.institutional.foreign)}</span></div><div className="flex justify-between border-b border-slate-800/50 pb-2"><span className="text-slate-400">投信買賣超</span><span className={`font-mono font-black text-2xl ${getColor(analysisData.institutional.investment)}`}>{formatNumberWithSign(analysisData.institutional.investment)}</span></div><div className="flex justify-between border-b border-slate-800/50 pb-2"><span className="text-slate-400">自營買賣超</span><span className={`font-mono font-black text-2xl ${getColor(analysisData.institutional.dealer)}`}>{formatNumberWithSign(analysisData.institutional.dealer)}</span></div></div><div className="mt-6 p-4 rounded-xl border flex justify-between items-center bg-slate-800/50 border-slate-700"><span className="font-bold">法人合計</span><span className="font-mono font-black text-3xl">{formatNumberWithSign(analysisData.institutional.total)}</span></div></div>
+                    <div className="bg-[#0B1121]/80 backdrop-blur-xl p-8 rounded-3xl border border-slate-800/80 shadow-2xl flex flex-col"><h3 className="text-xl font-black text-slate-200 mb-6 flex items-center gap-2"><Users size={24} className="text-cyan-500"/> 信用交易與軋空指標</h3><div className="space-y-4 text-lg flex-1"><div className="flex justify-between border-b border-slate-800/50 pb-2"><span className="text-slate-400">券資比</span><span className="font-mono font-black text-xl text-cyan-400">{analysisData.retail.marginShortRatio > 0 ? analysisData.retail.marginShortRatio.toFixed(2) + '%' : 'N/A'}</span></div><div className="flex justify-between border-b border-slate-800/50 pb-2"><span className="text-slate-400">擠壓力道</span><span className={`font-mono font-black text-xl ${getColor(analysisData.retail.squeezeForce)}`}>{analysisData.retail.squeezeForce.toFixed(2)}</span></div><div className="flex justify-between border-b border-slate-800/50 pb-2"><span className="text-slate-400">軋空力道</span><span className={`font-mono font-black text-xl ${getColor(analysisData.retail.shortSqueezeStrength)}`}>{analysisData.retail.shortSqueezeStrength.toFixed(2)}%</span></div><div className="flex justify-between border-b border-slate-800/50 pb-2"><span className="text-slate-400">當日沖銷佔比</span><span className="font-mono font-black text-xl text-white">{analysisData.retail.dayTradeRatio > 0 ? analysisData.retail.dayTradeRatio.toFixed(1) + '%' : 'N/A'}</span></div></div></div>
+                    <div className="bg-[#0B1121]/80 backdrop-blur-xl p-8 rounded-3xl border border-slate-800/80 shadow-2xl flex flex-col"><h3 className="text-xl font-black text-slate-200 mb-6 flex items-center gap-2"><PieChart size={24} className="text-amber-500"/> 大戶籌碼集中度</h3><div className="space-y-5 text-lg flex-1"><div className="flex justify-between border-b border-slate-800/50 pb-2"><span className="text-slate-400">400張以上大戶持有率</span><span className="font-mono font-black text-2xl text-amber-400">{analysisData.chips.majorForceRatio > 0 ? analysisData.chips.majorForceRatio.toFixed(2) + '%' : 'N/A'}</span></div><div className="flex justify-between border-b border-slate-800/50 pb-2"><span className="text-slate-400">真實週轉率</span><span className="font-mono font-black text-2xl text-white">{analysisData.chips.turnoverRate > 0 ? analysisData.chips.turnoverRate.toFixed(2) + '%' : 'N/A'}</span></div><div className="mt-8 p-4 bg-amber-900/20 text-amber-400 border border-amber-800/30 rounded-xl font-bold text-center text-lg shadow-inner">{analysisData.chips.concentration.split(' | ')[0]}</div></div></div>
+                  </div>
+
+                  <div className="mt-12 pt-8 border-t border-slate-800/50 w-full">
+                    <button onClick={() => setShowDetails(!showDetails)} className="flex items-center justify-center gap-2 text-cyan-400 hover:text-cyan-300 transition-colors mx-auto px-8 py-3 bg-cyan-900/20 rounded-full border border-cyan-800/50">
+                      {showDetails ? <ChevronDown size={24} /> : <ChevronRight size={24} />}
+                      <span className="text-lg font-bold tracking-widest">📄 詳細原始資料面板 (點擊展開)</span>
+                    </button>
+                    {showDetails && analysisData.retail?.detail && (
+                      <div className="mt-8 bg-[#04080F] p-8 rounded-2xl border border-slate-700 font-mono text-slate-300 whitespace-pre-wrap leading-relaxed text-base overflow-x-auto">
+{`==== 籌碼面資料 ====
+股票代號: ${analysisData.stockId} (${analysisData.stockName})
+
+==== 融資 ====
+融資買進: ${analysisData.retail.detail.finBuy} 張
+融資賣出: ${analysisData.retail.detail.finSell} 張
+融資現金償還: ${analysisData.retail.detail.finCashRepay} 張
+融資前日餘額: ${analysisData.retail.detail.finPrevBalance} 張
+融資今日餘額: ${analysisData.retail.detail.finCurrentBalance} 張
+融資使用率: ${analysisData.retail.detail.finUsage.toFixed(2)}%
+融資增減幅: ${analysisData.retail.detail.finChangeRate.toFixed(2)}%
+融資限額: ${analysisData.retail.detail.finQuota} 張
+
+==== 融券 ====
+融券買進: ${analysisData.retail.detail.secBuy} 張
+融券賣出: ${analysisData.retail.detail.secSell} 張
+融券現券償還: ${analysisData.retail.detail.secStockRepay} 張
+融券前日餘額: ${analysisData.retail.detail.secPrevBalance} 張
+融券今日餘額: ${analysisData.retail.detail.secCurrentBalance} 張
+融券使用率: ${analysisData.retail.detail.secUsage.toFixed(2)}%
+融券增減幅: ${analysisData.retail.detail.secChangeRate.toFixed(2)}%
+融券限額: ${analysisData.retail.detail.secQuota} 張
+
+==== 資券計算 ====
+5 日均融券餘額: ${analysisData.retail.detail.fiveDayAvgShort} 張
+券資比 (融券餘額 ÷ 融資餘額): ${analysisData.retail.detail.marginShortRatio.toFixed(2)}%
+擠壓力道 (Squeeze Force): ${analysisData.retail.detail.squeezeForce.toFixed(2)}
+軋空力道 (Short Squeeze Str.): ${analysisData.retail.detail.shortSqueezeStr.toFixed(2)}%
+`}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ======================= 分頁五：策略歷史回測 ======================= */}
+          {activeTab === 'backtest' && (
+            <div className="max-w-6xl mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500 pb-16">
+               <header className="mb-10 text-center">
+                 <h1 className="text-4xl font-black text-white tracking-tight mb-4 flex items-center justify-center gap-3"><BarChart3 className="text-emerald-400" size={36} strokeWidth={2.5}/> 量化策略回測實驗室</h1>
+               </header>
+               
+               <div className="bg-[#0B1121]/80 backdrop-blur-xl rounded-3xl p-8 border border-slate-800/80 mb-10 flex flex-col gap-6 shadow-2xl">
+                  {/* 選擇區間 */}
+                  <div className="flex flex-col md:flex-row items-center justify-between gap-4 border-b border-slate-800/80 pb-6">
+                      <div className="flex items-center gap-2 text-slate-300 font-bold text-lg"><CalendarClock className="text-emerald-500" size={24}/> 選擇回測區間</div>
+                      <div className="flex bg-slate-900 p-1.5 rounded-2xl border border-slate-700/50 w-full md:w-auto">
+                          {[1, 3, 6, 12].map(m => (
+                              <button key={m} onClick={() => setBacktestPeriod(m)} className={`flex-1 md:flex-none px-6 py-2.5 rounded-xl font-bold transition-all duration-300 ${backtestPeriod === m ? 'bg-emerald-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'}`}>
+                                  {m === 12 ? '1 年' : `${m} 個月`}
+                              </button>
+                          ))}
+                      </div>
+                  </div>
+
+                  {/* 輸入與按鈕 */}
+                  <div className="flex flex-col md:flex-row gap-4 items-stretch">
+                      <input type="text" value={backtestCode} onChange={e => setBacktestCode(e.target.value)} placeholder="輸入台股名稱或代號 (如: 台積電 或 2330)" className="flex-1 bg-[#0F172A] border-2 border-slate-700/80 rounded-2xl px-6 py-4 text-xl text-white font-mono focus:outline-none focus:border-emerald-500 text-center md:text-left" />
+                      <div className="flex gap-3">
+                          <button onClick={handleDownloadHistory} disabled={loadingBacktest} className="bg-slate-800 hover:bg-slate-700 text-white px-6 py-4 rounded-2xl font-bold flex items-center gap-2 border border-slate-700 disabled:opacity-50 whitespace-nowrap transition-all"><Download size={20}/>擷取 K 線</button>
+                          <button onClick={handleRunBacktest} disabled={loadingBacktest} className="bg-emerald-600 hover:bg-emerald-500 text-white px-8 py-4 rounded-2xl font-black text-lg flex items-center gap-2 disabled:opacity-50 whitespace-nowrap transition-all">{loadingBacktest ? '計算中...' : <Play size={20}/>}執行回測</button>
+                      </div>
+                  </div>
+              </div>
+
+              {backtestMsg && <div className={`mb-10 p-5 rounded-2xl border flex justify-center text-lg shadow-lg ${backtestMsg.includes('❌') ? 'bg-rose-900/20 border-rose-800/50 text-rose-400' : 'bg-emerald-900/20 border-emerald-800/50 text-emerald-400'}`}>{backtestMsg}</div>}
+
+              {/* 股票名稱與走勢圖顯示區 */}
+              {backtestSummary && (
+                <div className="bg-[#0B1121]/80 backdrop-blur-xl rounded-3xl p-8 border border-slate-800/80 mb-10 shadow-2xl animate-in fade-in zoom-in-95 duration-500">
+                    <div className="flex items-end justify-between mb-6 pb-4 border-b border-slate-800/80">
+                        <h2 className="text-4xl font-black text-white tracking-tight flex items-baseline gap-4">
+                            {backtestSummary.stockName} <span className="text-2xl font-mono text-emerald-400">{backtestSummary.stockId}</span>
+                        </h2>
+                    </div>
+                    <PriceChart labels={backtestSummary.labels} prices={backtestSummary.prices} />
+                </div>
+              )}
+
+              {/* 展開明細的結果表 */}
+              {backtestResults.length > 0 && (
+                <div className="bg-[#0B1121]/80 backdrop-blur-xl rounded-3xl overflow-hidden border border-slate-800/80 shadow-2xl animate-in fade-in zoom-in-95 duration-500 overflow-x-auto">
+                  <table className="w-full text-left min-w-[800px]">
+                    <thead className="bg-slate-900/60">
+                      <tr>
+                        <th className="p-6 text-slate-400 font-bold uppercase tracking-wider">執行策略模型 & 買賣規則 (點擊展開明細)</th>
+                        <th className="p-6 text-slate-400 font-bold uppercase tracking-wider">累積總報酬率</th>
+                        <th className="p-6 text-slate-400 font-bold uppercase tracking-wider">最大回撤</th>
+                        <th className="p-6 text-slate-400 font-bold uppercase tracking-wider">勝率</th>
+                        <th className="p-6 text-slate-400 font-bold uppercase tracking-wider text-right">最終資金</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/50">
+                      {backtestResults.map((res, i) => (
+                        <React.Fragment key={i}>
+                          <tr 
+                            onClick={() => setExpandedRow(expandedRow === i ? null : i)} 
+                            className={`transition-colors cursor-pointer group select-none ${expandedRow === i ? 'bg-slate-800/60' : 'hover:bg-slate-800/40'}`}
+                          >
+                            <td className="p-6 flex flex-col justify-center">
+                              <div className="flex items-center gap-3 text-lg font-bold text-white mb-1.5">
+                                <Activity size={18} className="text-emerald-500 shrink-0" />
+                                {res.strategy}
+                                <ChevronDown size={18} className={`text-slate-500 transition-transform duration-300 ${expandedRow === i ? 'rotate-180 text-cyan-400' : 'group-hover:text-slate-300'}`} />
+                              </div>
+                              <span className="text-sm text-slate-400 pl-7">{res.description}</span>
+                            </td>
+                            
+                            <td className={`p-6 font-mono font-black text-2xl ${getColor(res.totalReturn)}`}>{formatNumberWithSign(res.totalReturn)}%</td>
+                            <td className="p-6 font-mono text-xl text-amber-500/80 font-bold">-{res.maxDrawdown}%</td>
+                            <td className="p-6 font-mono text-xl text-cyan-400 font-bold">{res.winRate}%</td>
+                            <td className="p-6 font-mono font-black text-white text-3xl text-right tracking-tight whitespace-nowrap"><span className="text-emerald-500 mr-1">$</span>{res.finalCapital.toLocaleString()}</td>
+                          </tr>
+                          
+                          {/* 點擊展開的明細 */}
+                          {expandedRow === i && (
+                            <tr className="bg-[#04080F]/80 shadow-inner">
+                              <td colSpan={5} className="p-0 border-b border-slate-700/50">
+                                <div className="px-10 py-8 animate-in fade-in slide-in-from-top-2 duration-300">
+                                  <h4 className="text-base font-bold text-cyan-400 mb-5 flex items-center gap-2 tracking-widest"><Target size={18}/> 歷史詳細進出狀況 (交易紀錄)</h4>
+                                  
+                                  {res.trades && res.trades.length > 0 ? (
+                                    <div className="max-h-80 overflow-y-auto rounded-xl border border-slate-700/50 bg-slate-900/40 custom-scrollbar">
+                                      <table className="w-full text-left text-sm md:text-base">
+                                        <thead className="bg-slate-800 sticky top-0 z-10">
+                                          <tr>
+                                            <th className="p-4 text-slate-300 font-medium whitespace-nowrap">日期</th>
+                                            <th className="p-4 text-slate-300 font-medium whitespace-nowrap text-center">動作</th>
+                                            <th className="p-4 text-slate-300 font-medium whitespace-nowrap text-right">成交均價</th>
+                                            <th className="p-4 text-slate-300 font-medium whitespace-nowrap text-right">成交股數</th>
+                                            <th className="p-4 text-slate-300 font-medium whitespace-nowrap text-right">剩餘可用資金</th>
+                                            <th className="p-4 text-slate-300 font-medium whitespace-nowrap text-right pr-6">平倉單筆損益</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-800/30">
+                                          {res.trades.map((trade, tIdx) => (
+                                            <tr key={tIdx} className="hover:bg-slate-800/40 transition-colors">
+                                              <td className="p-4 font-mono text-slate-300 tracking-wider whitespace-nowrap">{trade.date}</td>
+                                              <td className="p-4 text-center">
+                                                <span className={`px-3 py-1 rounded-md text-xs font-bold whitespace-nowrap border ${trade.action === '買進' ? 'bg-rose-500/10 text-rose-400 border-rose-500/30' : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'}`}>
+                                                  {trade.action}
+                                                </span>
+                                              </td>
+                                              <td className="p-4 font-mono font-bold text-white text-right whitespace-nowrap">{trade.price.toFixed(2)}</td>
+                                              <td className="p-4 font-mono text-slate-300 text-right whitespace-nowrap">{trade.shares.toLocaleString()}</td>
+                                              <td className="p-4 font-mono text-slate-300 text-right whitespace-nowrap">${trade.capital.toLocaleString(undefined, {maximumFractionDigits: 0})}</td>
+                                              <td className={`p-4 font-mono font-black text-lg text-right pr-6 whitespace-nowrap ${trade.action === '賣出' ? getColor(trade.profit) : 'text-slate-600'}`}>
+                                                {trade.action === '賣出' ? formatNumberWithSign(Math.round(trade.profit)) : '-'}
+                                              </td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  ) : (
+                                    <div className="text-center py-10 text-slate-500 bg-slate-900/40 border border-slate-700/50 rounded-xl border-dashed">
+                                      在此 {backtestPeriod} 個月的區間內，該策略未能觸發任何符合規則的買賣訊號。
+                                    </div>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+        </main>
+      </div>
+
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #334155; border-radius: 20px; }
+      `}</style>
+    </div>
+  );
+};
+export default App;
