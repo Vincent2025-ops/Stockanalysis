@@ -6,6 +6,7 @@
 // - 基礎清單採用 TWSE 官方 OpenAPI (開放資料平台)，無連線封鎖限制
 // - 歷史指標 (布林通道下軌乖離率、10日均量比值) 統一採用 Yahoo Finance 日K資料
 // - 成交量與收盤價強制與 Yahoo 日K同步，徹底解決不同資料源時間軸落差問題
+// - 新增：自動往歷史回溯計算 10 日均量比值連續大於 0.5 的天數，並加入說明欄位
 package main
 
 import (
@@ -27,19 +28,20 @@ import (
 
 // StockData 定義單一檔股票的資料與其計算出的各項技術指標
 type StockData struct {
-	StockID     string  // 股票代號 (如: 2330)
-	StockName   string  // 股票名稱 (如: 台積電)
-	Price       float64 // 今日收盤價 (後續由 Yahoo 日K最新報價覆蓋校正)
-	PrevPrice   float64 // 昨收價 (用於計算單日簡易指標)
-	Volume      int     // 今日總成交量 (股數，由 Yahoo 日K最新資料覆蓋校正)
-	RSI         float64 // 相對強弱指標 (簡易單日估算)
-	KD          float64 // 隨機指標 (簡易單日估算)
-	MACD        float64 // 平滑異同移動平均線 (簡易單日估算)
-	SMA         float64 // 簡單移動平均線 (簡易單日估算)
-	Momentum    float64 // 動能指標 (簡易單日估算)
-	ChipRatio   float64 // 10日均量比值 (今日成交量 / 前10日均量基準)
-	Bollinger   float64 // 布林通道下軌乖離率 (負值代表跌破下軌)
-	CompanyInfo string  // 公司資訊 (備用欄位)
+	StockID       string  // 股票代號 (如: 2330)
+	StockName     string  // 股票名稱 (如: 台積電)
+	Price         float64 // 今日收盤價 (後續由 Yahoo 日K最新報價覆蓋校正)
+	PrevPrice     float64 // 昨收價 (用於計算單日簡易指標)
+	Volume        int     // 今日總成交量 (股數，由 Yahoo 日K最新資料覆蓋校正)
+	RSI           float64 // 相對強弱指標 (簡易單日估算)
+	KD            float64 // 隨機指標 (簡易單日估算)
+	MACD          float64 // 平滑異同移動平均線 (簡易單日估算)
+	SMA           float64 // 簡單移動平均線 (簡易單日估算)
+	Momentum      float64 // 動能指標 (簡易單日估算)
+	ChipRatio     float64 // 10日均量比值 (今日成交量 / 前10日均量基準)
+	ChipRatioDays int     // 🎯 10日均量比值連續大於 0.5 的天數 (已符合日數)
+	Bollinger     float64 // 布林通道下軌乖離率 (負值代表跌破下軌)
+	CompanyInfo   string  // 公司資訊 (備用欄位)
 }
 
 // =====================================================================
@@ -90,13 +92,14 @@ func fetchStockData() ([]StockData, error) {
 		}
 
 		tempStocks = append(tempStocks, StockData{
-			StockID:   stockID,
-			StockName: stockName,
-			Price:     price,
-			PrevPrice: prevPrice,
-			Volume:    volume,
-			ChipRatio: -1.0,   // 初始化為 -1.0，確保只有成功計算 Yahoo 歷史均量者才能進榜
-			Bollinger: 9999.0, // 初始化為極大值，未計算者排序置底
+			StockID:       stockID,
+			StockName:     stockName,
+			Price:         price,
+			PrevPrice:     prevPrice,
+			Volume:        volume,
+			ChipRatio:     -1.0,   // 初始化為 -1.0，確保只有成功計算 Yahoo 歷史均量者才能進榜
+			ChipRatioDays: 0,      // 初始化連續符合天數為 0
+			Bollinger:     9999.0, // 初始化為極大值，未計算者排序置底
 		})
 	}
 
@@ -164,7 +167,8 @@ func scanBollingerBands(stocks []StockData) {
 
 	for i := 0; i < topCount; i++ {
 		sid := sortedByVol[i].StockID
-		url := fmt.Sprintf("https://query2.finance.yahoo.com/v8/finance/chart/%s.TW?range=1mo&interval=1d", sid)
+		// 🎯 調整為 range=3mo (約60個交易日)，提供充足的歷史長度以追溯計算連續符合天數
+		url := fmt.Sprintf("https://query2.finance.yahoo.com/v8/finance/chart/%s.TW?range=3mo&interval=1d", sid)
 		
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
@@ -195,10 +199,9 @@ func scanBollingerBands(stocks []StockData) {
 				}
 			}
 			
-			// 1. 布林通道計算 (至少需 15 天歷史價格)
+			// 1. 布林通道計算 (嚴格截取最後 20 日對齊布林通道 20MA 標準)
 			if len(validPrices) >= 15 {
 				pricesForBB := validPrices
-				// 只取近 20 日對齊布林通道 20MA 標準
 				if len(pricesForBB) > 20 {
 					pricesForBB = pricesForBB[len(pricesForBB)-20:]
 				}
@@ -217,7 +220,7 @@ func scanBollingerBands(stocks []StockData) {
 				}
 			}
 
-			// 2. 10日均量比值計算 (排除無效量)
+			// 2. 10日均量比值與「連續符合天數」計算
 			var validVols []float64
 			for _, v := range vols {
 				if v >= 0 {
@@ -239,10 +242,30 @@ func scanBollingerBands(stocks []StockData) {
 				avgV := sumV / 10.0
 
 				if avgV > 0 {
-					ratio := todayVol / avgV // 今日量 / 前10日均量
+					ratio := todayVol / avgV // 當日比值
+
+					// 🎯 核心計算：回溯歷史 K 線，統計比值連續大於 0.5 的天數
+					consecutiveDays := 0
+					for t := n - 1; t >= 10; t-- {
+						// 計算當日 t 過去 10 個交易日的成交量總和
+						sumDayV := 0.0
+						for _, v := range validVols[t-10 : t] {
+							sumDayV += v
+						}
+						avgDayV := sumDayV / 10.0
+
+						// 若該日比值 > 0.5 則天數累加；一旦小於等於 0.5 立即中斷連續計數
+						if avgDayV > 0 && (validVols[t]/avgDayV) > 0.5 {
+							consecutiveDays++
+						} else {
+							break
+						}
+					}
+
 					for j := range stocks {
 						if stocks[j].StockID == sid {
 							stocks[j].ChipRatio = ratio
+							stocks[j].ChipRatioDays = consecutiveDays // 記錄連續符合天數
 							// 強制將收盤價與成交量校正為 Yahoo 最新真實日K資料
 							if len(validPrices) > 0 {
 								stocks[j].Price = validPrices[len(validPrices)-1]
@@ -385,8 +408,8 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 				desc = "動能指標上升，顯示市場買氣強勁"
 			case "ChipRatio":
 				valueStr = fmt.Sprintf("%.2f", stock.ChipRatio)
-				// 完整輸出策略規則與當前比值
-				desc = fmt.Sprintf("籌碼集中度提升，顯示主力介入 (10 日均量比值大於 0.5 時買進，小於 0.5 時平倉)，目前指標數值：%.2f", stock.ChipRatio)
+				// 🎯 加入「已連續符合 %d 日」動態說明
+				desc = fmt.Sprintf("籌碼集中度提升，顯示主力介入 (10 日均量比值大於 0.5 時買進，小於 0.5 時平倉)，目前指標數值：%.2f (已連續符合 %d 日)", stock.ChipRatio, stock.ChipRatioDays)
 			case "Bollinger":
 				if stock.Bollinger > 5.0 {
 					continue
@@ -429,7 +452,7 @@ func main() {
 		return
 	}
 
-	// 步驟 2：針對前 500 大個股進行歷史 K 線深度掃描 (布林通道 + 均量比值校正)
+	// 步驟 2：針對前 500 大個股進行歷史 K 線深度掃描 (布林通道 + 均量比值校正 + 連續天數計算)
 	scanBollingerBands(stocks)
 
 	// 步驟 3：依各指標排序取 Top 10
