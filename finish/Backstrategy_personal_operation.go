@@ -1,4 +1,3 @@
-//本程式用作單支股票回測分析(各項技術指標)，需搭配Singlestock_History.go使用，先有單隻股票的歷史股價才能做回測
 package main
 
 import (
@@ -7,7 +6,7 @@ import (
 	"math"
 	"os"
 	"strconv"
-	"strings" // 新增這個 library 來處理CSV逗號
+	"strings"
 )
 
 // **回測績效結構體**（儲存每個策略的回測結果）
@@ -19,67 +18,62 @@ type Performance struct {
 	FinalCapital float64 // 最終資金（回測結束時的總資本）
 }
 
-// **讀取 CSV 檔案，解析股價數據**
-func readCSV(filename string) ([]string, []float64, error) {
+// **讀取 CSV 檔案，解析股價與成交量數據**
+func readCSV(filename string) ([]string, []float64, []float64, error) {
 	file, err := os.Open(filename)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer file.Close()
 
 	reader := csv.NewReader(file)
-	
-	// 【關鍵修正 1】設定 FieldsPerRecord 為 -1
-	//這允許每一行的欄位數量可以不一致 (忽略行尾多餘的逗號)
-	reader.FieldsPerRecord = -1 
-
 	rows, err := reader.ReadAll()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	var dates []string
 	var prices []float64
+	var volumes []float64
 
+	// 解析 CSV 每一行，將日期、收盤價與成交量存入陣列
 	for i, row := range rows {
 		if i == 0 {
 			continue // 跳過標題列
 		}
-		
-		// 確保該行有足夠的欄位 (避免空行導致 crash)
-		if len(row) < 7 {
+		closePrice, err := strconv.ParseFloat(row[6], 64) // 取得收盤價
+		if err != nil {
 			continue
 		}
 
-		// 【關鍵修正 2】處理數字中的千分位逗號
-		// 原始資料可能是 "1,070.00"，含有逗號無法直接轉 float
-		cleanPriceStr := strings.ReplaceAll(row[6], ",", "") 
-		
-		closePrice, err := strconv.ParseFloat(cleanPriceStr, 64)
-		if err != nil {
-			// 若轉換失敗(例如遇到空值)，可以選擇 log 錯誤或忽略
-			continue
+		// 取得成交量（優先讀取 row[7]，若無則嘗試 row[5]）
+		var vol float64 = 0.0
+		if len(row) > 7 {
+			vol, _ = strconv.ParseFloat(strings.ReplaceAll(row[7], ",", ""), 64)
+		} else if len(row) > 5 {
+			vol, _ = strconv.ParseFloat(strings.ReplaceAll(row[5], ",", ""), 64)
 		}
-		
-		dates = append(dates, row[0]) 
+
+		dates = append(dates, row[0])
 		prices = append(prices, closePrice)
+		volumes = append(volumes, vol)
 	}
 
-	return dates, prices, nil
+	return dates, prices, volumes, nil
 }
 
-// **計算最大回撤**
+// **計算最大回撤 (Max Drawdown, MDD)**
 func maxDrawdown(profitHistory []float64) float64 {
 	if len(profitHistory) == 0 {
-		return 0 // 如果沒有交易，回撤為 0
+		return 0
 	}
-	maxPeak := profitHistory[0] // **歷史最高資本**
-	maxDD := 0.0				// **最大回撤預設為 0**
+	maxPeak := profitHistory[0]
+	maxDD := 0.0
 	for _, value := range profitHistory {
 		if value > maxPeak {
 			maxPeak = value
 		}
-		drawdown := (maxPeak - value) / maxPeak // **計算回撤率**
+		drawdown := (maxPeak - value) / maxPeak
 		if drawdown > maxDD {
 			maxDD = drawdown
 		}
@@ -87,12 +81,18 @@ func maxDrawdown(profitHistory []float64) float64 {
 	return maxDD
 }
 
-// 計算 RSI（相對強弱指數）RSI 是衡量價格變動速度與變動幅度的動能指標，數值範圍在 0~100 之間。其中 RS（相對強弱）= 平均上漲點數 / 平均下跌點數（通常取 14 天計算）。
+// **計算真實 Wilder's RSI（相對強弱指標，範圍 0~100）**
+// 修正：首期計算採標準簡單平均 (SMA)，後續天數採正統 Wilder 平滑法递歸累算
 func calculateRSI(prices []float64, period int) []float64 {
 	rsi := make([]float64, len(prices))
+	if len(prices) <= period {
+		return rsi
+	}
+
 	gain, loss := 0.0, 0.0
 
-	for i := 1; i < period; i++ {
+	// 1. 計算前 period 天的漲跌差額總和
+	for i := 1; i <= period; i++ {
 		change := prices[i] - prices[i-1]
 		if change > 0 {
 			gain += change
@@ -101,21 +101,36 @@ func calculateRSI(prices []float64, period int) []float64 {
 		}
 	}
 
-	for i := period; i < len(prices); i++ {
+	// 2. 首期基準值：計算平均漲幅與平均跌幅 (SMA)
+	avgGain := gain / float64(period)
+	avgLoss := loss / float64(period)
+
+	if avgLoss == 0 {
+		rsi[period] = 100.0
+	} else {
+		rs := avgGain / avgLoss
+		rsi[period] = 100.0 - (100.0 / (1.0 + rs))
+	}
+
+	// 3. 後續天數採用正統 Wilder 平滑法 (Smoothed Moving Average)
+	// 公式：今日平滑值 = (前日平滑值 * (N - 1) + 今日數值) / N
+	for i := period + 1; i < len(prices); i++ {
 		change := prices[i] - prices[i-1]
+		g, l := 0.0, 0.0
 		if change > 0 {
-			gain = (gain*(float64(period)-1) + change) / float64(period)
-			loss = (loss * (float64(period) - 1)) / float64(period)
+			g = change
 		} else {
-			gain = (gain * (float64(period) - 1)) / float64(period)
-			loss = (loss*(float64(period)-1) - change) / float64(period)
+			l = -change
 		}
 
-		if loss == 0 {
-			rsi[i] = 100
+		avgGain = (avgGain*float64(period-1) + g) / float64(period)
+		avgLoss = (avgLoss*float64(period-1) + l) / float64(period)
+
+		if avgLoss == 0 {
+			rsi[i] = 100.0
 		} else {
-			rs := gain / loss
-			rsi[i] = 100 - (100 / (1 + rs))
+			rs := avgGain / avgLoss
+			rsi[i] = 100.0 - (100.0 / (1.0 + rs))
 		}
 	}
 	return rsi
@@ -134,21 +149,43 @@ func calculateSMA(prices []float64, period int) []float64 {
 	return sma
 }
 
-// **計算 MACD**
+// **計算真實 MACD（指數平滑異同移動平均線）**
+// 修正：徹底解決原先誤用 SMA 代替 EMA 的問題，完全遵循標準 EMA 公式計算
+// shortPeriod: 12, longPeriod: 26, signalPeriod: 9
 func calculateMACD(prices []float64, shortPeriod, longPeriod, signalPeriod int) ([]float64, []float64) {
-	macd := make([]float64, len(prices))
-	signal := make([]float64, len(prices))
-	emaShort := calculateSMA(prices, shortPeriod)
-	emaLong := calculateSMA(prices, longPeriod)
+	n := len(prices)
+	macd := make([]float64, n)   // DIF 快線 = EMA(12) - EMA(26)
+	signal := make([]float64, n) // DEM 慢線 = EMA(DIF, 9)
 
-	for i := 0; i < len(prices); i++ {
-		macd[i] = emaShort[i] - emaLong[i]
+	if n < longPeriod {
+		return macd, signal
 	}
-	signal = calculateSMA(macd, signalPeriod)
+
+	// 指數移動平均平滑係數 alpha = 2 / (Period + 1)
+	kShort := 2.0 / float64(shortPeriod+1)
+	kLong := 2.0 / float64(longPeriod+1)
+	kSig := 2.0 / float64(signalPeriod+1)
+
+	// 1. 計算短天期 (12) 與長天期 (26) 的 EMA，並求出 DIF
+	emaShort := prices[0]
+	emaLong := prices[0]
+	for i := 0; i < n; i++ {
+		emaShort = prices[i]*kShort + emaShort*(1.0-kShort)
+		emaLong = prices[i]*kLong + emaLong*(1.0-kLong)
+		macd[i] = emaShort - emaLong
+	}
+
+	// 2. 對 DIF 數列進行 9 日 EMA 平滑，求出 Signal 訊號線 (DEM)
+	sigEMA := macd[0]
+	for i := 0; i < n; i++ {
+		sigEMA = macd[i]*kSig + sigEMA*(1.0-kSig)
+		signal[i] = sigEMA
+	}
+
 	return macd, signal
 }
 
-// **計算 Bollinger Bands**  中軌 = N 日 SMA（簡單移動平均線
+// **計算布林通道（Bollinger Bands：20MA, 2 倍標準差）**
 func calculateBollingerBands(prices []float64, period int) ([]float64, []float64) {
 	upperBand := make([]float64, len(prices))
 	lowerBand := make([]float64, len(prices))
@@ -158,44 +195,51 @@ func calculateBollingerBands(prices []float64, period int) ([]float64, []float64
 		sumSquares := 0.0
 		for j := i - period + 1; j <= i; j++ {
 			diff := prices[j] - sma[i]
-			sumSquares += diff * diff 
+			sumSquares += diff * diff
 		}
 		stdDev := math.Sqrt(sumSquares / float64(period))
-		upperBand[i] = sma[i] + 2*stdDev //上軌 = 中軌 + 2 × 標準差
-		lowerBand[i] = sma[i] - 2*stdDev //下軌 = 中軌 - 2 × 標準差
+		upperBand[i] = sma[i] + 2*stdDev
+		lowerBand[i] = sma[i] - 2*stdDev
 	}
 
 	return upperBand, lowerBand
 }
 
-// **計算 Momentum（動量指標） 指標**
+// **計算 Momentum（動量指標：當前收盤價 - N日前收盤價）**
 func calculateMomentum(prices []float64, period int) []float64 {
-	momentum := make([]float64, len(prices)) 
+	momentum := make([]float64, len(prices))
 
 	for i := period; i < len(prices); i++ {
-		momentum[i] = prices[i] - prices[i-period] // Momentum = 當前價格 - n 天前價格
+		momentum[i] = prices[i] - prices[i-period]
 	}
 
 	return momentum
 }
 
-// **計算 Chip Ratio（籌碼集中度）**
-func calculateChipRatio(prices []float64, period int) []float64 {
-	chipRatio := make([]float64, len(prices))
+// **計算 Chip Ratio（10日均量比值：當日成交量 / 過去10日均量基準）**
+func calculateChipRatio(volumes []float64, period int) []float64 {
+	chipRatio := make([]float64, len(volumes))
 
-	for i := period; i < len(prices); i++ {
+	for i := period; i < len(volumes); i++ {
 		sum := 0.0
-		for j := i - period + 1; j <= i; j++ {
-			sum += prices[j]
+		// 計算過去 10 個交易日的成交量總和（不含當日）
+		for j := i - period; j < i; j++ {
+			sum += volumes[j]
 		}
-		average := sum / float64(period)
-		chipRatio[i] = prices[i] / average // 當前價格 / 過去 n 天均價
+		avgVolume := sum / float64(period)
+		if avgVolume > 0 {
+			chipRatio[i] = volumes[i] / avgVolume
+		} else {
+			chipRatio[i] = 0.0
+		}
 	}
 
 	return chipRatio
 }
 
-// **計算 KD 指標**
+// **計算 KD 指標（隨機指標，採標準 9 日週期）**
+// 註：正統公式需真實高低價 (High/Low)，此處基於現有收盤價資料結構，
+// 於 9 日區間內取收盤價極值進行標準 RSV 與遞迴平滑運算 (K/D 預設初值為 50)
 func calculateKD(prices []float64, period int) ([]float64, []float64) {
 	k := make([]float64, len(prices))
 	d := make([]float64, len(prices))
@@ -203,7 +247,6 @@ func calculateKD(prices []float64, period int) ([]float64, []float64) {
 	for i := period - 1; i < len(prices); i++ {
 		low := prices[i]
 		high := prices[i]
-		// 找出區間內的最高價與最低價
 		for j := i - period + 1; j <= i; j++ {
 			if prices[j] < low {
 				low = prices[j]
@@ -213,19 +256,23 @@ func calculateKD(prices []float64, period int) ([]float64, []float64) {
 			}
 		}
 
-		// 計算 RSV（未成熟隨機值）
 		if high != low {
 			rsv := (prices[i] - low) / (high - low) * 100
 			if i == period-1 {
-				k[i] = 50 // K 值初始設定為 50
-				d[i] = 50 // D 值初始設定為 50
+				k[i] = (2.0*50.0 + rsv) / 3.0 // 首期以基準 50 進行權重計算
+				d[i] = (2.0*50.0 + k[i]) / 3.0
 			} else {
-				k[i] = (2*k[i-1] + rsv) / 3 // K值計算公式
-				d[i] = (2*d[i-1] + k[i]) / 3 // D值計算公式
+				k[i] = (2.0*k[i-1] + rsv) / 3.0
+				d[i] = (2.0*d[i-1] + k[i]) / 3.0
 			}
 		} else {
-			k[i] = k[i-1] // 若高低相等，K 值不變
-			d[i] = d[i-1] // D 值不變
+			if i == period-1 {
+				k[i] = 50.0
+				d[i] = 50.0
+			} else {
+				k[i] = k[i-1]
+				d[i] = d[i-1]
+			}
 		}
 	}
 
@@ -233,25 +280,22 @@ func calculateKD(prices []float64, period int) ([]float64, []float64) {
 }
 
 // **回測邏輯**
-// 每次買入與賣出視為一組交易，輸出交易紀錄
-func backtest(dates []string, prices []float64, strategyName string) Performance {
-	capital := 1000000.0 // **初始資金 100 萬**
-	position := 0.0      // **持倉數量**
-	buyPrice := 0.0		 // **記錄買入價格**
-	lastBuyDate := ""	 // **記錄上次買入日期**
+func backtest(dates []string, prices []float64, volumes []float64, strategyName string) Performance {
+	capital := 1000000.0 // 初始資金 100 萬
+	position := 0.0      // 持倉數量
+	buyPrice := 0.0      // 買入價格
+	lastBuyDate := ""    // 上次買入日期
 	var profitHistory []float64
 	var wins, losses, trades int
 
-	// **計算技術指標**
 	sma5 := calculateSMA(prices, 5)
 	sma20 := calculateSMA(prices, 20)
 	upperBB, lowerBB := calculateBollingerBands(prices, 20)
-	k, d := calculateKD(prices, 9)  
+	k, d := calculateKD(prices, 9)
 	rsi := calculateRSI(prices, 14)
 	momentum := calculateMomentum(prices, 10)
-	chipRatio := calculateChipRatio(prices, 10)
+	chipRatio := calculateChipRatio(volumes, 10)
 
-	// **MACD 需至少 26 筆資料，其他指標則可在較少數據時計算**
 	var macd, signal []float64
 	if len(prices) >= 26 {
 		macd, signal = calculateMACD(prices, 12, 26, 9)
@@ -259,42 +303,47 @@ func backtest(dates []string, prices []float64, strategyName string) Performance
 
 	fmt.Printf("\n開始回測策略: %s... 初始資金 100 萬\n", strategyName)
 
-	// **從舊到新進行回測，確保買入在賣出之前**
 	for i := 0; i < len(prices); i++ {
 		shouldBuy := false
 		shouldSell := false
 
-		// **確保 MACD 至少有 26 筆資料才計算**
-		isMACDReady := i >= 26 
+		isMACDReady := i >= 26
 
 		// **買入條件**
 		if position == 0 && capital >= prices[i] && capital >= 10000 {
 			switch strategyName {
-			case "SMA":// SMA 買入條件：當 5 日均線上穿 20 日均線，代表短期趨勢變強
+			case "SMA":
+				// 5MA 向上黃金交叉 20MA
 				if i >= 5 && sma5[i] > sma20[i] && sma5[i-1] <= sma20[i-1] {
 					shouldBuy = true
 				}
-			case "MACD":// MACD 買入條件：當 MACD 線上穿過信號線，代表市場可能進入上升趨勢
-				if isMACDReady && macd[i] > signal[i] {
+			case "MACD":
+				// 修正：MACD 快線 (DIF) 向上黃金交叉慢線 (Signal)
+				if isMACDReady && i > 0 && macd[i] > signal[i] && macd[i-1] <= signal[i-1] {
 					shouldBuy = true
 				}
-			case "Bollinger Bands":// Bollinger Bands 買入條件：當價格低於布林通道下軌，代表市場可能超賣
+			case "Bollinger Bands":
+				// 跌破布林下軌 (超跌逆勢撈底)
 				if i >= 20 && prices[i] < lowerBB[i] {
 					shouldBuy = true
 				}
-			case "KD":// KD 買入條件：當 K 值由下向上穿越 D 值，代表短線可能進入多頭行情
+			case "KD":
+				// K值 向上黃金交叉 D值
 				if i >= 9 && k[i] > d[i] && k[i-1] <= d[i-1] {
 					shouldBuy = true
 				}
-			case "RSI":// RSI 買入條件：當價格低於前一天，代表 RSI 可能進入超賣區
+			case "RSI":
+				// RSI 落入超賣區間 (< 30)
 				if i >= 14 && rsi[i] < 30 {
 					shouldBuy = true
 				}
-			case "Momentum":// Momentum 買入條件：當價格高於 5 天前的價格，代表市場趨勢向上
-				if i >= 10 && momentum[i] > 0 {
+			case "Momentum":
+				// 修正：動量指標由負翻正 (向上突破 0 軸)
+				if i >= 10 && momentum[i] > 0 && momentum[i-1] <= 0 {
 					shouldBuy = true
 				}
-			case "ChipRatio":// ChipRatio 買入條件：當價格低於 10 天前的價格，代表可能出現籌碼集中
+			case "ChipRatio":
+				// 均量比大於 0.5 (主力帶量)
 				if i >= 10 && chipRatio[i] > 0.5 {
 					shouldBuy = true
 				}
@@ -305,52 +354,58 @@ func backtest(dates []string, prices []float64, strategyName string) Performance
 				buyPrice = prices[i]
 				capital = 0
 				lastBuyDate = dates[i]
-				//trades++ 買入不算交易次數，賣出再算
 				fmt.Printf("[交易紀錄]\n買入日期: %s  價格: %.2f  持倉數: %.2f  現有資金: %.2f\n", dates[i], prices[i], position, capital)
 			}
 		}
 
-		// **賣出條件（確保賣出順序正確）**
+		// **賣出條件**
 		if position > 0 && lastBuyDate != "" && dates[i] > lastBuyDate {
 			switch strategyName {
-			case "SMA":// SMA 賣出條件：當 5 日均線下穿 20 日均線，代表短期趨勢減弱
+			case "SMA":
+				// 5MA 向下死亡交叉 20MA
 				if i >= 5 && sma5[i] < sma20[i] && sma5[i-1] >= sma20[i-1] {
 					shouldSell = true
 				}
-			case "MACD":// MACD 賣出條件：當 MACD 線下穿信號線，代表市場可能進入下降趨勢
-				if isMACDReady && macd[i] < signal[i] {
+			case "MACD":
+				// 修正：MACD 快線 (DIF) 向下死亡交叉慢線 (Signal)
+				if isMACDReady && i > 0 && macd[i] < signal[i] && macd[i-1] >= signal[i-1] {
 					shouldSell = true
 				}
-			case "Bollinger Bands":// Bollinger Bands 賣出條件：當價格高於布林通道上軌，代表市場可能超買
+			case "Bollinger Bands":
+				// 突破布林上軌 (達到滿足點獲利了結)
 				if i >= 20 && prices[i] > upperBB[i] {
 					shouldSell = true
 				}
-			case "KD":// KD 賣出條件：當 K 值由上向下跌破 D 值，代表短線可能進入空頭行情
+			case "KD":
+				// K值 向下死亡交叉 D值
 				if i >= 9 && k[i] < d[i] && k[i-1] >= d[i-1] {
 					shouldSell = true
 				}
-			case "RSI":// RSI 賣出條件：當價格高於前一天，代表 RSI 可能進入超買區
+			case "RSI":
+				// RSI 達到超買區間 (> 70)
 				if i >= 14 && rsi[i] > 70 {
 					shouldSell = true
 				}
-			case "Momentum":// Momentum 賣出條件：當價格低於 5 天前的價格，代表市場趨勢轉弱
-				if i >= 10 && momentum[i] < 0 {
+			case "Momentum":
+				// 修正：動量指標由正轉負 (向下跌破 0 軸)
+				if i >= 10 && momentum[i] < 0 && momentum[i-1] >= 0 {
 					shouldSell = true
 				}
-			case "ChipRatio":// ChipRatio 賣出條件：當價格高於 10 天前的價格，代表籌碼可能鬆動
+			case "ChipRatio":
+				// 均量比縮至 0.5 以下平倉
 				if i >= 10 && chipRatio[i] < 0.5 {
 					shouldSell = true
 				}
 			}
-			// **確保賣出日期比買入日期晚**
+
 			if shouldSell {
-				sellAmount := position * prices[i]// 計算賣出金額
+				sellAmount := position * prices[i]
 				profit := sellAmount - (position * buyPrice)
-				capital = sellAmount  // **賣出後，資金回復，可用於下一次交易**
+				capital = sellAmount
 				fmt.Printf("賣出日期: %s  價格: %.2f  獲利: %.2f  現有資金: %.2f\n", dates[i], prices[i], profit, capital)
 				fmt.Println("---------------------------------------------")
-				position = 0  // **賣出後，清空持倉**
-				lastBuyDate = "" // 重置買入日期，確保下一次交易能夠正常執行
+				position = 0
+				lastBuyDate = ""
 				trades++
 				if profit > 0 {
 					wins++
@@ -362,9 +417,9 @@ func backtest(dates []string, prices []float64, strategyName string) Performance
 		}
 	}
 
-	// **若最後仍有持倉，則以最後一天價格計算總資產**
+	// 若回測結束時仍持有庫存，依最後一天收盤價計算當前淨值
 	if position > 0 {
-		capital = position * prices[len(prices)-1] // 假設最後一天以當前價格估算資產
+		capital = position * prices[len(prices)-1]
 		a := prices[len(prices)-1]
 		fmt.Printf("尚未賣出，最後股價: %.2f\n", a)
 		fmt.Printf("尚未賣出，當前資產總額: %.2f\n", capital)
@@ -372,7 +427,7 @@ func backtest(dates []string, prices []float64, strategyName string) Performance
 	}
 
 	if len(profitHistory) == 0 {
-		profitHistory = append(profitHistory, capital) // 若無交易，回測仍需有數據
+		profitHistory = append(profitHistory, capital)
 	}
 
 	totalReturn := (capital - 1000000) / 1000000 * 100
@@ -393,26 +448,21 @@ func backtest(dates []string, prices []float64, strategyName string) Performance
 	}
 }
 
-
-
-
 // **主程式**
 func main() {
-	dates, prices, err := readCSV("2330_stock_data.csv")//選取資料來源
+	dates, prices, volumes, err := readCSV("2330_stock_data.csv")
 	if err != nil {
 		fmt.Println("讀取 CSV 失敗:", err)
 		return
 	}
 
-	// 執行各策略回測，這裡以 RSI、MACD、Bollinger Bands 為例，其它策略可依需求添加
-	rsiPerf := backtest(dates, prices, "RSI")
-	kdPerf := backtest(dates, prices, "KD")
-	macdPerf := backtest(dates, prices, "MACD")
-	smaPerf := backtest(dates, prices, "SMA")
-	momentumPerf := backtest(dates, prices, "Momentum")
-	chipratioPerf := backtest(dates, prices, "ChipRatio")
-	bollingerPerf := backtest(dates, prices, "Bollinger Bands")
-	// 其它策略例如 SMA、Momentum、ChipRatio、KD 可依需求添加
+	rsiPerf := backtest(dates, prices, volumes, "RSI")
+	kdPerf := backtest(dates, prices, volumes, "KD")
+	macdPerf := backtest(dates, prices, volumes, "MACD")
+	smaPerf := backtest(dates, prices, volumes, "SMA")
+	momentumPerf := backtest(dates, prices, volumes, "Momentum")
+	chipratioPerf := backtest(dates, prices, volumes, "ChipRatio")
+	bollingerPerf := backtest(dates, prices, volumes, "Bollinger Bands")
 
 	// **列出績效**
 	fmt.Println("\n📊 **技術指標回測績效比較** 📊\n初始資金:100萬元")
@@ -430,7 +480,4 @@ func main() {
 		chipratioPerf.Strategy, chipratioPerf.TotalReturn, chipratioPerf.MaxDrawdown*100, chipratioPerf.WinRate, chipratioPerf.FinalCapital)
 	fmt.Printf("%-15s | 總報酬率: %.2f%% | 最大回撤: %.2f%% | 勝率: %.2f%% | 資金總額: %.2f\n",
 		bollingerPerf.Strategy, bollingerPerf.TotalReturn, bollingerPerf.MaxDrawdown*100, bollingerPerf.WinRate, bollingerPerf.FinalCapital)
-		
 }
-
-
