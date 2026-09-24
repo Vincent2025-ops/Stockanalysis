@@ -5,7 +5,7 @@
 // 核心特色：
 // - 基礎清單採用 TWSE 官方 OpenAPI (開放資料平台)
 // - 三大法人日報採用 TWSE 官方最新日結資料 (支援盤中/假日自動回溯最近交易日)
-// - 歷史指標 (RSI, KD, MACD, SMA, Momentum, 布林通道, 均量比值) 統一採用 Yahoo Finance 真實歷史日K
+// - 歷史指標 (RSI, KD, MACD, SMA, Momentum, Volume Ratio, 布林通道) 統一採用 Yahoo Finance 真實歷史日K
 // - 🎯 全指標升級：所有指標均統計「已連續符合 xx 日」
 // - 🎯 價格買點分流：各指標依交易哲學量身打造價格買點基準，並「買點優先排序」
 package main
@@ -57,9 +57,10 @@ type StockData struct {
 	MomentumDays        int     // 10日動能連續為正之天數
 	IsMomentumBuyPoint  bool    // 是否符合動能買點 (價格高於 10 日均價)
 
-	ChipRatio           float64 // 10日均量比值 (今日成交量 / 前10日均量基準)
-	ChipRatioDays       int     // 10日均量比值連續大於 0.5 的天數
-	IsChipBuyPoint      bool    // 是否符合「10日均量比>0.5 且 法人買超>0 且 價格<10MA」之買點條件
+	// 🎯 Volume Ratio 欄位 (與其他技術指標命名風格一致)
+	VolumeRatio         float64 // 10日均量比值 (今日成交量 / 前10日均量基準)
+	VolumeRatioDays     int     // 10日均量比值連續大於 1.5 的天數 (帶量突破發動)
+	IsVolumeRatioBuyPoint bool  // 是否符合成交量均量比買點 (10日均量比值 > 1.5 帶量突破發動)
 
 	Bollinger           float64 // 布林通道下軌乖離率 (負值代表跌破下軌)
 	BollingerDays       int     // 連續跌破布林通道下軌天數
@@ -127,37 +128,37 @@ func fetchStockData() ([]StockData, error) {
 		}
 
 		tempStocks = append(tempStocks, StockData{
-			StockID:             stockID,
-			StockName:           stockName,
-			Price:               price,
-			PrevPrice:           prevPrice,
-			Volume:              volume,
-			RSI:                 -1.0,
-			RSIDays:             0,
-			IsRSIBuyPoint:       false,
-			KD:                  -1.0,
-			KDDays:              0,
-			IsKDBuyPoint:        false,
-			MACD:                -9999.0,
-			MACDDays:            0,
-			IsMACDBuyPoint:      false,
-			SMA:                 -9999.0,
-			SMADays:             0,
-			IsSMABuyPoint:       false,
-			Momentum:            -9999.0,
-			MomentumDays:        0,
-			IsMomentumBuyPoint:  false,
-			ChipRatio:           -1.0,
-			ChipRatioDays:       0,
-			IsChipBuyPoint:      false,
-			Bollinger:           9999.0,
-			BollingerDays:       0,
-			IsBollingerBuyPoint: false,
-			MA5:                 0.0,
-			MA10:                0.0,
-			MA20:                0.0,
-			BollingerDn:         0.0,
-			InstitutionalNetBuy: 0,
+			StockID:               stockID,
+			StockName:             stockName,
+			Price:                 price,
+			PrevPrice:             prevPrice,
+			Volume:                volume,
+			RSI:                   -1.0,
+			RSIDays:               0,
+			IsRSIBuyPoint:         false,
+			KD:                    -1.0,
+			KDDays:                0,
+			IsKDBuyPoint:          false,
+			MACD:                  -9999.0,
+			MACDDays:              0,
+			IsMACDBuyPoint:        false,
+			SMA:                   -9999.0,
+			SMADays:               0,
+			IsSMABuyPoint:         false,
+			Momentum:              -9999.0,
+			MomentumDays:          0,
+			IsMomentumBuyPoint:    false,
+			VolumeRatio:           -1.0,
+			VolumeRatioDays:       0,
+			IsVolumeRatioBuyPoint: false,
+			Bollinger:             9999.0,
+			BollingerDays:         0,
+			IsBollingerBuyPoint:   false,
+			MA5:                   0.0,
+			MA10:                  0.0,
+			MA20:                  0.0,
+			BollingerDn:           0.0,
+			InstitutionalNetBuy:   0,
 		})
 	}
 
@@ -307,17 +308,17 @@ func scanBollingerBands(stocks []StockData) {
 			closes := quote.Close
 			vols := quote.Volume
 
+			// 🎯 價格與成交量同步過濾：確保天數與時間點 100% 精準對齊
 			var validPrices []float64
-			for _, p := range closes {
-				if p > 0 {
-					validPrices = append(validPrices, p)
-				}
-			}
-
 			var validVols []float64
-			for _, v := range vols {
-				if v >= 0 {
-					validVols = append(validVols, v)
+			minLen := len(closes)
+			if len(vols) < minLen {
+				minLen = len(vols)
+			}
+			for k := 0; k < minLen; k++ {
+				if closes[k] > 0 && vols[k] > 0 {
+					validPrices = append(validPrices, closes[k])
+					validVols = append(validVols, vols[k])
 				}
 			}
 			
@@ -469,44 +470,31 @@ func scanBollingerBands(stocks []StockData) {
 							stocks[j].IsMomentumBuyPoint = true
 						}
 
-						// 7. 🎯 10 日均量比值、連續符合天數與買點判定
+						// 7. 🎯 Volume Ratio 計算與買點判定 (與 Backstrategy 邏輯完全一致)
 						if len(validVols) >= 11 {
-							n := len(validVols)
-							todayVol := validVols[n-1]
-							prev10Vols := validVols[n-11 : n-1]
-							sumV := 0.0
-							for _, v := range prev10Vols {
-								sumV += v
-							}
-							avgV := sumV / 10.0
+							vrSeries := calculateVolumeRatio(validVols, 10)
+							latestVR := vrSeries[len(vrSeries)-1]
+							stocks[j].VolumeRatio = latestVR
 
-							if avgV > 0 {
-								stocks[j].ChipRatio = todayVol / avgV
-
-								consecutiveDays := 0
-								for t := n - 1; t >= 10; t-- {
-									sumDayV := 0.0
-									for _, v := range validVols[t-10 : t] {
-										sumDayV += v
-									}
-									avgDayV := sumDayV / 10.0
-									if avgDayV > 0 && (validVols[t]/avgDayV) > 0.5 {
-										consecutiveDays++
-									} else {
-										break
-									}
-								}
-								stocks[j].ChipRatioDays = consecutiveDays
-
-								// 買點條件：均量比>0.5 且 法人買超>0 且 價格<10MA
-								if stocks[j].ChipRatio > 0.5 && stocks[j].InstitutionalNetBuy > 0 && latestP < ma10 {
-									stocks[j].IsChipBuyPoint = true
+							// 統計連續 10 日均量比 > 1.5 的天數 (帶量突破發動持續天數)
+							vrDays := 0
+							for t := len(vrSeries) - 1; t >= 10; t-- {
+								if vrSeries[t] > 1.5 {
+									vrDays++
 								} else {
-									stocks[j].IsChipBuyPoint = false
+									break
 								}
-
-								stocks[j].Volume = int(todayVol)
 							}
+							stocks[j].VolumeRatioDays = vrDays
+
+							// 買點條件：10 日均量比值 > 1.5 (帶量突破發動)
+							if latestVR > 1.5 {
+								stocks[j].IsVolumeRatioBuyPoint = true
+							} else {
+								stocks[j].IsVolumeRatioBuyPoint = false
+							}
+
+							stocks[j].Volume = int(validVols[len(validVols)-1])
 						}
 
 						countCalculated++
@@ -519,6 +507,25 @@ func scanBollingerBands(stocks []StockData) {
 	}
 	
 	fmt.Printf("✅ 分析完成！成功深度運算各項技術指標: %d 檔個股。\n", countCalculated)
+}
+
+// calculateVolumeRatio 計算 Volume Ratio（10日均量比值：當日成交量 / 過去10日均量基準，不含當日）
+func calculateVolumeRatio(volumes []float64, period int) []float64 {
+	volRatio := make([]float64, len(volumes))
+	for i := period; i < len(volumes); i++ {
+		sum := 0.0
+		// 計算過去 10 個交易日的成交量總和（不含當日）
+		for j := i - period; j < i; j++ {
+			sum += volumes[j]
+		}
+		avgVolume := sum / float64(period)
+		if avgVolume > 0 {
+			volRatio[i] = volumes[i] / avgVolume
+		} else {
+			volRatio[i] = 0.0
+		}
+	}
+	return volRatio
 }
 
 // calculateBollinger 依據收盤價序列計算布林通道 (中軌、上軌、下軌)
@@ -716,7 +723,7 @@ func getTop10(stocks []StockData, indicator string) []StockData {
 		if indicator == "Momentum" && s.Momentum < -9000 {
 			continue
 		}
-		if indicator == "ChipRatio" && s.ChipRatio < 0 {
+		if (indicator == "Volume Ratio" || indicator == "成交量均量比策略（Volume Ratio）" || indicator == "ChipRatio") && s.VolumeRatio < 0 {
 			continue
 		}
 		if indicator == "Bollinger" && s.Bollinger > 9000 {
@@ -757,12 +764,12 @@ func getTop10(stocks []StockData, indicator string) []StockData {
 				return candidates[i].IsMomentumBuyPoint
 			}
 			return candidates[i].Momentum > candidates[j].Momentum
-		case "ChipRatio":
-			// 🎯 買點優先：量比>0.5 且 法人買超 且 價格<10MA 優先排前
-			if candidates[i].IsChipBuyPoint != candidates[j].IsChipBuyPoint {
-				return candidates[i].IsChipBuyPoint
+		case "Volume Ratio", "成交量均量比策略（Volume Ratio）", "ChipRatio":
+			// 🎯 買點優先：10 日均量比值 > 1.5 (帶量突破發動) 優先排前，再依均量比值降冪排序
+			if candidates[i].IsVolumeRatioBuyPoint != candidates[j].IsVolumeRatioBuyPoint {
+				return candidates[i].IsVolumeRatioBuyPoint
 			}
-			return candidates[i].ChipRatio > candidates[j].ChipRatio
+			return candidates[i].VolumeRatio > candidates[j].VolumeRatio
 		case "Bollinger":
 			// 🎯 買點優先：價格跌破布林下軌者優先排前
 			if candidates[i].IsBollingerBuyPoint != candidates[j].IsBollingerBuyPoint {
@@ -779,7 +786,7 @@ func getTop10(stocks []StockData, indicator string) []StockData {
 	return candidates
 }
 
-// exportToCSV 將 7 大指標計算結果依格式輸出成 CSV 檔案
+// exportToCSV 將 7 大指標計算結果依格式輸出成 CSV 檔案 (第 8 欄為資料日期)
 func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 	file, err := os.Create(fileName)
 	if err != nil {
@@ -791,13 +798,17 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	writer.Write([]string{"技術指標", "股票代號", "名稱", "價格", "成交量", "指標值", "說明"})
-	order := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "ChipRatio", "Bollinger"}
+	// 1. 標題列
+	writer.Write([]string{"技術指標", "股票代號", "名稱", "價格", "成交量", "指標值", "說明", "資料日期"})
+	order := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "Volume Ratio", "Bollinger"}
+
+	// 2. 取得今日產出檔案的確切日期 (YYYY-MM-DD)
+	todayStr := time.Now().Format("2006-01-02")
 
 	for _, indicator := range order {
 		stocks, ok := allTop10[indicator]
 		if !ok || len(stocks) == 0 {
-			writer.Write([]string{indicator, "-", "-", "-", "-", "-", "今日無符合條件個股"})
+			writer.Write([]string{indicator, "-", "-", "-", "-", "-", "今日無符合條件個股", todayStr})
 			continue
 		}
 
@@ -841,13 +852,12 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 				} else {
 					desc = fmt.Sprintf("近 10 日動能向上 (漲幅 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格未高於 10 日均價:非近期買點", stock.Momentum, stock.Momentum, stock.MomentumDays)
 				}
-			case "ChipRatio":
-				valueStr = fmt.Sprintf("%.2f", stock.ChipRatio)
-				netBuyLots := stock.InstitutionalNetBuy / 1000
-				if stock.IsChipBuyPoint {
-					desc = fmt.Sprintf("籌碼集中度提升，顯示主力介入 (10 日均量比值大於 0.5 且三大法人買超 且小於 0.5 時平倉)，目前指標數值：%.2f (已連續符合 %d 日，法人買超：%+d 張)，目前價格低於 10 日均價:此為近期買點", stock.ChipRatio, stock.ChipRatioDays, netBuyLots)
+			case "Volume Ratio", "成交量均量比策略（Volume Ratio）", "ChipRatio":
+				valueStr = fmt.Sprintf("%.2f", stock.VolumeRatio)
+				if stock.IsVolumeRatioBuyPoint {
+					desc = fmt.Sprintf("成交量帶量突破 (10 日均量比值 > 1.5，跌破 10MA 或爆量長黑平倉)，目前指標數值：%.2f (已連續符合 %d 日)，10 日均量比值大於 1.5:此為近期買點(帶量突破發動)", stock.VolumeRatio, stock.VolumeRatioDays)
 				} else {
-					desc = fmt.Sprintf("籌碼集中度提升，顯示主力介入 (10 日均量比值大於 0.5 且三大法人買超 且小於 0.5 時平倉)，目前指標數值：%.2f (已連續符合 %d 日，法人買超：%+d 張)，目前價格未低於 10 日均價或法人未買超:非近期買點", stock.ChipRatio, stock.ChipRatioDays, netBuyLots)
+					desc = fmt.Sprintf("成交量均量比值未達發動標準 (10 日均量比值需 > 1.5)，目前指標數值：%.2f (已連續符合 %d 日)，10 日均量比值未大於 1.5:非近期買點", stock.VolumeRatio, stock.VolumeRatioDays)
 				}
 			case "Bollinger":
 				if stock.Bollinger > 5.0 {
@@ -861,6 +871,7 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 				}
 			}
 
+			// 每一列固定帶入 todayStr 作為確切日期標記
 			writer.Write([]string{
 				indicator,
 				stock.StockID,
@@ -869,6 +880,7 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 				strconv.Itoa(stock.Volume),       
 				valueStr,
 				desc,
+				todayStr,
 			})
 		}
 	}
@@ -903,7 +915,7 @@ func main() {
 	scanBollingerBands(stocks)
 
 	// 步驟 3：依各真實指標排序取 Top 10 (各指標買點優先排序)
-	indicators := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "ChipRatio", "Bollinger"}
+	indicators := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "Volume Ratio", "Bollinger"}
 	allTop10 := make(map[string][]StockData)
 
 	for _, ind := range indicators {
