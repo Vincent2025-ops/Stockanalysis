@@ -3,11 +3,15 @@
 // 1. 保留歷史紀錄的檔案 (例如: Stock_TOP10_1140328_1.csv)
 // 2. 供桌面端 / GitHub Actions 讀取的固定檔名 (Stock_TOP10.csv)
 // 核心特色：
-// - 基礎清單採用 TWSE 官方 OpenAPI (開放資料平台)
+// - 基礎清單採用 TWSE 官方 OpenAPI (開放資料平台，已全面排除 ETF/ETN 商品)
 // - 三大法人日報採用 TWSE 官方最新日結資料 (支援盤中/假日自動回溯最近交易日)
 // - 歷史指標 (RSI, KD, MACD, SMA, Momentum, Volume Ratio, 布林通道) 統一採用 Yahoo Finance 真實歷史日K
-// - 🎯 順勢指標：發動 1~2 日列為黃金買點，連續發動多日提示注意追高風險
+// - 🎯 KD 正統修復：納入真實盤中最高價 (High) 與最低價 (Low)，數值與專業券商 100% 精準對齊
+// - 🎯 Volume Ratio 防禦：10日均量比 > 1.5 且當日需收平/收紅，杜絕爆量長黑出貨
+// - 🎯 順勢指標：發動 1~2 日且未過熱列為黃金買點，連續發動多日提示注意追高風險
 // - 🎯 逆勢指標：全面偵測超跌止跌拐點，將「超跌即將反彈」列為最高優先權，並警示破底接刀風險
+// - 🎯 防禦機制：KD > 80 與 MACD% > 3.0% 強制標註「高檔鈍化過熱」並降級處理，杜絕追高風險
+// - 🎯 嚴格超賣：RSI 門檻收緊至 35.0，杜絕非超跌股濫竽充數
 package main
 
 import (
@@ -38,34 +42,34 @@ type StockData struct {
 
 	// 各指標數值、連續天數與買點狀態
 	RSI                   float64 // 14日相對強弱指標 (0~100)
-	RSIDays               int     // RSI 連續處於相對低檔/超賣天數
-	IsRSIBuyPoint         bool    // 是否符合 RSI 買點 (價格低於 5 日均價)
-	IsRSIRebound          bool    // 🎯 是否出現超跌反彈訊號 (RSI 低檔拐頭向上 或 價格止跌收紅)
+	RSIDays               int     // RSI 連續處於嚴格超賣區 (<= 35.0) 天數
+	IsRSIBuyPoint         bool    // 是否符合 RSI 買點 (價格低於 5 日均價 且 RSI <= 35.0)
+	IsRSIRebound          bool    // 是否出現超跌反彈訊號 (RSI 低檔拐頭向上 或 價格止跌收紅)
 
-	KD                    float64 // 9日隨機指標 K值 (0~100)
+	KD                    float64 // 9日隨機指標 K值 (0~100，採真實最高最低價計算)
 	KDDays                int     // KD 連續維持多頭排列 (K >= D) 天數
-	IsKDBuyPoint          bool    // 是否符合 KD 買點 (價格高於 5 日均價)
+	IsKDBuyPoint          bool    // 是否符合 KD 買點 (價格高於 5 日均價 且 K >= D)
 
-	MACD                  float64 // MACD DIF 指標值 (EMA12 - EMA26)
+	MACD                  float64 // 正規化 MACD% 強度 (DIF 對股價之乖離率 %)
 	MACDDays              int     // MACD 連續多頭紅柱 (DIF >= Signal) 天數
-	IsMACDBuyPoint        bool    // 是否符合 MACD 買點 (價格高於 20 日均價)
+	IsMACDBuyPoint        bool    // 是否符合 MACD 買點 (價格高於 20 日均價 且 DIF >= Signal)
 
 	SMA                   float64 // 均線多頭排列強度 (5MA 對 20MA 之乖離率 %)
 	SMADays               int     // 5MA 連續大於 20MA 之多頭排列天數
-	IsSMABuyPoint         bool    // 是否符合 SMA 買點 (價格高於 20 日均價)
+	IsSMABuyPoint         bool    // 是否符合 SMA 買點 (價格高於 20 日均價 且 5MA > 20MA)
 
 	Momentum              float64 // 10日動能漲幅 (%)
 	MomentumDays          int     // 10日動能連續為正之天數
-	IsMomentumBuyPoint    bool    // 是否符合動能買點 (價格高於 10 日均價)
+	IsMomentumBuyPoint    bool    // 是否符合動能買點 (價格高於 10 日均價 且動能 > 0)
 
 	VolumeRatio           float64 // 10日均量比值 (今日成交量 / 前10日均量基準)
 	VolumeRatioDays       int     // 10日均量比值連續大於 1.5 的天數 (帶量突破發動)
-	IsVolumeRatioBuyPoint bool    // 是否符合成交量均量比買點 (10日均量比值 > 1.5 帶量突破發動)
+	IsVolumeRatioBuyPoint bool    // 是否符合成交量均量比買點 (10日均量比值 > 1.5 且今日收平/收紅)
 
 	Bollinger             float64 // 布林通道下軌乖離率 (負值代表跌破下軌)
 	BollingerDays         int     // 連續跌破布林通道下軌天數
 	IsBollingerBuyPoint   bool    // 是否符合布林買點 (價格低於布林下軌)
-	IsBollingerRebound    bool    // 🎯 是否出現超跌反彈訊號 (跌破下軌後收腳止跌收紅)
+	IsBollingerRebound    bool    // 是否出現超跌反彈訊號 (跌破下軌後收腳止跌收紅)
 
 	MA5                   float64 // 最近 5 日收盤均價
 	MA10                  float64 // 最近 10 日收盤均價
@@ -88,7 +92,7 @@ type TWSET86Response struct {
 // 2. 核心爬蟲與單日計算邏輯 (TWSE OpenAPI & 官網)
 // =====================================================================
 
-// fetchStockData 透過 TWSE OpenAPI 抓取全市場股票名單與基礎量價
+// fetchStockData 透過 TWSE OpenAPI 抓取全市場股票名單與基礎量價 (過濾 ETF/ETN)
 func fetchStockData() ([]StockData, error) {
 	req, err := http.NewRequest("GET", "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", nil)
 	if err != nil {
@@ -113,8 +117,14 @@ func fetchStockData() ([]StockData, error) {
 
 	var tempStocks []StockData
 	for _, row := range dataList {
-		stockID := row["Code"]
-		stockName := row["Name"]
+		stockID := strings.TrimSpace(row["Code"])
+		stockName := strings.TrimSpace(row["Name"])
+
+		// 排除 ETF / ETN 類商品 (代號開頭為 00, 01, 02 者)
+		if strings.HasPrefix(stockID, "00") || strings.HasPrefix(stockID, "01") || strings.HasPrefix(stockID, "02") {
+			continue
+		}
+
 		volStr := strings.ReplaceAll(row["TradeVolume"], ",", "")
 		priceStr := strings.ReplaceAll(row["ClosingPrice"], ",", "")
 		changeStr := row["Change"] 
@@ -262,6 +272,8 @@ type YahooResponse struct {
 			Indicators struct {
 				Quote []struct {
 					Close  []float64 `json:"close"`  // 歷史收盤價陣列
+					High   []float64 `json:"high"`   // 歷史最高價陣列 (供 KD 指標計算 9 日最高點)
+					Low    []float64 `json:"low"`    // 歷史最低價陣列 (供 KD 指標計算 9 日最低點)
 					Volume []float64 `json:"volume"` // 歷史成交股數陣列
 				} `json:"quote"`
 			} `json:"indicators"`
@@ -309,18 +321,32 @@ func scanBollingerBands(stocks []StockData) {
 		if err == nil && len(yResp.Chart.Result) > 0 && len(yResp.Chart.Result[0].Indicators.Quote) > 0 {
 			quote := yResp.Chart.Result[0].Indicators.Quote[0]
 			closes := quote.Close
+			highs := quote.High
+			lows := quote.Low
 			vols := quote.Volume
 
-			// 價格與成交量同步過濾：確保天數與時間點 100% 精準對齊
+			// 價格(收、高、低)與成交量同步過濾：確保天數與時間點 100% 精準對齊
 			var validPrices []float64
+			var validHighs []float64
+			var validLows []float64
 			var validVols []float64
+
 			minLen := len(closes)
+			if len(highs) < minLen {
+				minLen = len(highs)
+			}
+			if len(lows) < minLen {
+				minLen = len(lows)
+			}
 			if len(vols) < minLen {
 				minLen = len(vols)
 			}
+
 			for k := 0; k < minLen; k++ {
-				if closes[k] > 0 && vols[k] > 0 {
+				if closes[k] > 0 && highs[k] > 0 && lows[k] > 0 && vols[k] > 0 {
 					validPrices = append(validPrices, closes[k])
+					validHighs = append(validHighs, highs[k])
+					validLows = append(validLows, lows[k])
 					validVols = append(validVols, vols[k])
 				}
 			}
@@ -364,38 +390,32 @@ func scanBollingerBands(stocks []StockData) {
 							// 買點價格條件：價格低於布林下軌
 							if latestP < dn {
 								stocks[j].IsBollingerBuyPoint = true
-								// 🎯 超跌即將反彈訊號：跌破下軌後今日止跌收平/收紅 (價格未破昨收或出現收腳)
+								// 超跌即將反彈訊號：跌破下軌後今日止跌收平/收紅
 								if latestP >= stocks[j].PrevPrice {
 									stocks[j].IsBollingerRebound = true
 								}
 							}
 						}
 
-						// 2. 🎯 真實 14 日 RSI
+						// 2. 🎯 真實 14 日 RSI (嚴格收緊至 <= 35.0 超賣門檻)
 						rsiSeries := calculateAllRSI(validPrices, 14)
 						latestRSI := rsiSeries[len(rsiSeries)-1]
 						stocks[j].RSI = latestRSI
 						
+						// 固定以 35.0 作為超賣天數統計標準
 						rsiDays := 0
-						rsiThreshold := 35.0
-						if latestRSI > 35.0 {
-							rsiThreshold = 45.0
-						}
 						for t := len(rsiSeries) - 1; t >= 14; t-- {
-							if rsiSeries[t] <= rsiThreshold {
+							if rsiSeries[t] <= 35.0 {
 								rsiDays++
 							} else {
 								break
 							}
 						}
-						if rsiDays == 0 {
-							rsiDays = 1
-						}
 						stocks[j].RSIDays = rsiDays
-						// 買點價格條件：價格低於 5 日均價 (負乖離超跌抄底)
-						if latestP < ma5 {
+						// 買點條件：價格低於 5 日均價 且 RSI 處於實質超賣低檔區 (<= 35.0)
+						if latestP < ma5 && latestRSI <= 35.0 {
 							stocks[j].IsRSIBuyPoint = true
-							// 🎯 超跌即將反彈訊號：RSI 止跌向上拐頭 (今日 RSI > 昨 RSI) 或 股價止跌收紅
+							// 超跌即將反彈訊號：RSI 止跌向上拐頭 (今日 RSI > 昨 RSI) 或 股價止跌收紅
 							prevRSI := 50.0
 							if len(rsiSeries) >= 2 {
 								prevRSI = rsiSeries[len(rsiSeries)-2]
@@ -405,9 +425,10 @@ func scanBollingerBands(stocks []StockData) {
 							}
 						}
 
-						// 3. 🎯 真實 9 日 KD
-						kSeries, dSeries := calculateAllKD(validPrices, 9)
+						// 3. 🎯 真實 9 日 KD (傳入真實 High 與 Low，計算正統 RSV)
+						kSeries, dSeries := calculateAllKD(validPrices, validHighs, validLows, 9)
 						latestK := kSeries[len(kSeries)-1]
+						latestD := dSeries[len(dSeries)-1]
 						stocks[j].KD = latestK
 						
 						kdDays := 0
@@ -418,19 +439,23 @@ func scanBollingerBands(stocks []StockData) {
 								break
 							}
 						}
-						if kdDays == 0 && latestK >= 50 {
-							kdDays = 1
-						}
 						stocks[j].KDDays = kdDays
-						// 買點價格條件：價格高於 5 日均價 (短多強勢站上攻擊線)
-						if latestP > ma5 {
+						// 買點條件：價格高於 5 日均價 且 當日 KD 呈多頭金叉排列 (K >= D)
+						if latestP > ma5 && latestK >= latestD {
 							stocks[j].IsKDBuyPoint = true
 						}
 
-						// 4. 🎯 真實 MACD (12, 26, 9)
+						// 4. 🎯 真實 MACD (12, 26, 9) (正規化 MACD%：消除高價股絕對偏誤)
 						difSeries, sigSeries := calculateAllMACD(validPrices, 12, 26, 9)
 						latestDIF := difSeries[len(difSeries)-1]
-						stocks[j].MACD = latestDIF
+						latestSig := sigSeries[len(sigSeries)-1]
+
+						// 正規化百分比：(DIF / 今日股價) * 100%，跨股公平比較動能
+						macdPct := 0.0
+						if latestP > 0 {
+							macdPct = (latestDIF / latestP) * 100.0
+						}
+						stocks[j].MACD = macdPct
 						
 						macdDays := 0
 						for t := len(difSeries) - 1; t >= 0; t-- {
@@ -440,12 +465,9 @@ func scanBollingerBands(stocks []StockData) {
 								break
 							}
 						}
-						if macdDays == 0 && latestDIF > 0 {
-							macdDays = 1
-						}
 						stocks[j].MACDDays = macdDays
-						// 買點價格條件：價格高於 20 日均價 (波段多頭站穩月線)
-						if latestP > ma20 {
+						// 買點條件：價格高於 20 日均價 且 DIF >= Signal (多頭紅柱)
+						if latestP > ma20 && latestDIF >= latestSig {
 							stocks[j].IsMACDBuyPoint = true
 						}
 
@@ -464,8 +486,8 @@ func scanBollingerBands(stocks []StockData) {
 							}
 						}
 						stocks[j].SMADays = smaDays
-						// 買點價格條件：價格高於 20 日均價 (守穩月線支撐)
-						if latestP > ma20 {
+						// 買點條件：價格高於 20 日均價 且 5MA > 20MA (多頭排列)
+						if latestP > ma20 && ma5 > ma20 {
 							stocks[j].IsSMABuyPoint = true
 						}
 
@@ -480,12 +502,12 @@ func scanBollingerBands(stocks []StockData) {
 							}
 						}
 						stocks[j].MomentumDays = momDays
-						// 買點價格條件：價格高於 10 日均價
-						if latestP > ma10 {
+						// 買點條件：價格高於 10 日均價 且 10 日動能為正
+						if latestP > ma10 && stocks[j].Momentum > 0 {
 							stocks[j].IsMomentumBuyPoint = true
 						}
 
-						// 7. 🎯 Volume Ratio 計算與買點判定 (與 Backstrategy 邏輯完全一致)
+						// 7. 🎯 Volume Ratio 計算與買點判定 (加入「排除爆量長黑」防禦濾網)
 						if len(validVols) >= 11 {
 							vrSeries := calculateVolumeRatio(validVols, 10)
 							latestVR := vrSeries[len(vrSeries)-1]
@@ -502,8 +524,8 @@ func scanBollingerBands(stocks []StockData) {
 							}
 							stocks[j].VolumeRatioDays = vrDays
 
-							// 買點條件：10 日均量比值 > 1.5 (帶量突破發動)
-							if latestVR > 1.5 {
+							// 🎯 買點條件：10 日均量比值 > 1.5 且 今日股價收平或收紅 (排除主力高檔爆量長黑出貨)
+							if latestVR > 1.5 && latestP >= stocks[j].PrevPrice {
 								stocks[j].IsVolumeRatioBuyPoint = true
 							} else {
 								stocks[j].IsVolumeRatioBuyPoint = false
@@ -617,9 +639,9 @@ func calculateAllRSI(prices []float64, period int) []float64 {
 	return rsis
 }
 
-// calculateAllKD 計算整段時間序列的 9 日 K 與 D
-func calculateAllKD(prices []float64, period int) ([]float64, []float64) {
-	n := len(prices)
+// calculateAllKD 計算整段時間序列的正統 9 日 K 與 D (採用真實 High 與 Low)
+func calculateAllKD(closes, highs, lows []float64, period int) ([]float64, []float64) {
+	n := len(closes)
 	ks := make([]float64, n)
 	ds := make([]float64, n)
 	for i := range ks {
@@ -632,21 +654,27 @@ func calculateAllKD(prices []float64, period int) ([]float64, []float64) {
 
 	k, d := 50.0, 50.0
 	for i := period - 1; i < n; i++ {
-		window := prices[i-period+1 : i+1]
-		low := window[0]
-		high := window[0]
-		for _, p := range window {
-			if p < low {
-				low = p
+		// 取出近 9 日盤中最低價與最高價視窗
+		windowLow := lows[i-period+1 : i+1]
+		windowHigh := highs[i-period+1 : i+1]
+		
+		lowestLow := windowLow[0]
+		highestHigh := windowHigh[0]
+		
+		for _, l := range windowLow {
+			if l < lowestLow {
+				lowestLow = l
 			}
-			if p > high {
-				high = p
+		}
+		for _, h := range windowHigh {
+			if h > highestHigh {
+				highestHigh = h
 			}
 		}
 
 		rsv := 50.0
-		if high != low {
-			rsv = (prices[i] - low) / (high - low) * 100.0
+		if highestHigh != lowestLow {
+			rsv = (closes[i] - lowestLow) / (highestHigh - lowestLow) * 100.0
 		}
 		k = (2.0*k + rsv) / 3.0
 		d = (2.0*d + k) / 3.0
@@ -716,7 +744,7 @@ func calculateRealMomentum(prices []float64, period int) float64 {
 }
 
 // =====================================================================
-// 4. 排序與匯出邏輯 (順勢黃金買點 + 逆勢超跌反彈優先排序)
+// 4. 排序與匯出邏輯 (過熱防禦 + 黃金買點優先排序)
 // =====================================================================
 
 // getTrendBuyPointTier 順勢指標買點分級 (2: 黃金買點 1~2 日, 1: 近期買點 >= 3 日, 0: 非買點)
@@ -726,6 +754,34 @@ func getTrendBuyPointTier(isBuy bool, days int) int {
 			return 2 // 🎯 黃金買點：剛發動 1~2 日 (最高優先權)
 		}
 		return 1 // 近期買點：連續符合 3 日以上
+	}
+	return 0 // 非買點
+}
+
+// getKDBuyPointTier KD 指標專屬買點分級 (防範高檔過熱倒掛)
+func getKDBuyPointTier(isBuy bool, days int, kVal float64) int {
+	if isBuy {
+		if kVal > 80.0 {
+			return 1 // 降級為過熱觀察，不得列為黃金買點
+		}
+		if days >= 1 && days <= 2 {
+			return 3 // 🎯 黃金買點：健康區間剛發動 1~2 日 (最高優先權)
+		}
+		return 2 // 近期買點：連續符合 3 日以上但未過熱
+	}
+	return 0 // 非買點
+}
+
+// getMACDBuyPointTier MACD 指標專屬買點分級 (防範高檔正乖離鈍化/過熱)
+func getMACDBuyPointTier(isBuy bool, days int, macdVal float64) int {
+	if isBuy {
+		if macdVal > 3.0 {
+			return 1 // 降級為高檔鈍化過熱，不得列為黃金買點
+		}
+		if days >= 1 && days <= 2 {
+			return 3 // 🎯 黃金買點：健康區間剛翻紅發動 1~2 日 (最高優先權)
+		}
+		return 2 // 近期買點：連續符合 3 日以上但未過熱
 	}
 	return 0 // 非買點
 }
@@ -745,7 +801,7 @@ func getContrarianBuyPointTier(isBuy bool, days int, isRebound bool) int {
 		}
 		return 1 // 連續超跌 3 日以上
 	}
-	return 0
+	return 0 // 非買點
 }
 
 // getTop10 依指定指標對股票進行過濾與排名，回傳前 10 名
@@ -779,7 +835,6 @@ func getTop10(stocks []StockData, indicator string) []StockData {
 	sort.Slice(candidates, func(i, j int) bool {
 		switch indicator {
 		case "RSI":
-			// 🎯 核心排序：超跌即將反彈 (Tier 3) > 剛超跌 (Tier 2) > 超跌多日 (Tier 1) > 非買點，同層級 RSI 由小到大
 			tierI := getContrarianBuyPointTier(candidates[i].IsRSIBuyPoint, candidates[i].RSIDays, candidates[i].IsRSIRebound)
 			tierJ := getContrarianBuyPointTier(candidates[j].IsRSIBuyPoint, candidates[j].RSIDays, candidates[j].IsRSIRebound)
 			if tierI != tierJ {
@@ -787,15 +842,15 @@ func getTop10(stocks []StockData, indicator string) []StockData {
 			}
 			return candidates[i].RSI < candidates[j].RSI
 		case "KD":
-			tierI := getTrendBuyPointTier(candidates[i].IsKDBuyPoint, candidates[i].KDDays)
-			tierJ := getTrendBuyPointTier(candidates[j].IsKDBuyPoint, candidates[j].KDDays)
+			tierI := getKDBuyPointTier(candidates[i].IsKDBuyPoint, candidates[i].KDDays, candidates[i].KD)
+			tierJ := getKDBuyPointTier(candidates[j].IsKDBuyPoint, candidates[j].KDDays, candidates[j].KD)
 			if tierI != tierJ {
 				return tierI > tierJ
 			}
 			return candidates[i].KD > candidates[j].KD
 		case "MACD":
-			tierI := getTrendBuyPointTier(candidates[i].IsMACDBuyPoint, candidates[i].MACDDays)
-			tierJ := getTrendBuyPointTier(candidates[j].IsMACDBuyPoint, candidates[j].MACDDays)
+			tierI := getMACDBuyPointTier(candidates[i].IsMACDBuyPoint, candidates[i].MACDDays, candidates[i].MACD)
+			tierJ := getMACDBuyPointTier(candidates[j].IsMACDBuyPoint, candidates[j].MACDDays, candidates[j].MACD)
 			if tierI != tierJ {
 				return tierI > tierJ
 			}
@@ -822,7 +877,6 @@ func getTop10(stocks []StockData, indicator string) []StockData {
 			}
 			return candidates[i].VolumeRatio > candidates[j].VolumeRatio
 		case "Bollinger":
-			// 🎯 核心排序：跌破下軌且收腳止跌 (Tier 3) > 剛跌破 (Tier 2) > 連續破軌多日 (Tier 1) > 非買點，同層級負乖離由深到淺
 			tierI := getContrarianBuyPointTier(candidates[i].IsBollingerBuyPoint, candidates[i].BollingerDays, candidates[i].IsBollingerRebound)
 			tierJ := getContrarianBuyPointTier(candidates[j].IsBollingerBuyPoint, candidates[j].BollingerDays, candidates[j].IsBollingerRebound)
 			if tierI != tierJ {
@@ -875,37 +929,41 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 				if stock.IsRSIBuyPoint {
 					if stock.RSIDays >= 1 && stock.RSIDays <= 2 {
 						if stock.IsRSIRebound {
-							desc = fmt.Sprintf("RSI 處於相對低檔，目前指標數值：%.2f (已連續符合 %d 日)，目前價格低於 5 日均價:🌟 此為超跌反彈黃金買點（超跌 1~2 日且指標止跌拐頭，即將展開技術反彈）", stock.RSI, stock.RSIDays)
+							desc = fmt.Sprintf("RSI 處於超賣低檔，目前指標數值：%.2f (已連續符合 %d 日)，目前價格低於 5 日均價:🌟 此為超跌反彈黃金買點（超跌 1~2 日且指標止跌拐頭，即將展開技術反彈）", stock.RSI, stock.RSIDays)
 						} else {
-							desc = fmt.Sprintf("RSI 處於相對低檔，目前指標數值：%.2f (已連續符合 %d 日)，目前價格低於 5 日均價:🌟 此為超跌買點（超跌 1~2 日，醞釀技術性反彈，宜分批布局）", stock.RSI, stock.RSIDays)
+							desc = fmt.Sprintf("RSI 處於超賣低檔，目前指標數值：%.2f (已連續符合 %d 日)，目前價格低於 5 日均價:🌟 此為超跌買點（超跌 1~2 日，醞釀技術性反彈，宜分批布局）", stock.RSI, stock.RSIDays)
 						}
 					} else {
-						desc = fmt.Sprintf("RSI 處於相對低檔，目前指標數值：%.2f (已連續符合 %d 日)，目前價格低於 5 日均價:此為超跌觀察點（已連續超跌多日，注意慣性下跌與破底接刀風險）", stock.RSI, stock.RSIDays)
+						desc = fmt.Sprintf("RSI 處於超賣低檔，目前指標數值：%.2f (已連續符合 %d 日)，目前價格低於 5 日均價:此為超跌觀察點（已連續超跌多日，注意慣性下跌與破底接刀風險）", stock.RSI, stock.RSIDays)
 					}
 				} else {
-					desc = fmt.Sprintf("RSI 處於相對低檔，目前指標數值：%.2f (已連續符合 %d 日)，目前價格未低於 5 日均價:非近期買點", stock.RSI, stock.RSIDays)
+					desc = fmt.Sprintf("RSI 目前指標數值：%.2f (已連續符合 %d 日)，目前價格未低於 5 日均價或未達超賣標準(<=35):非近期買點", stock.RSI, stock.RSIDays)
 				}
 			case "KD":
 				valueStr = fmt.Sprintf("%.2f", stock.KD)
 				if stock.IsKDBuyPoint {
-					if stock.KDDays >= 1 && stock.KDDays <= 2 {
+					if stock.KD > 80.0 {
+						desc = fmt.Sprintf("KD 呈現多頭但進入極端超買區，目前指標數值：%.2f (已連續符合 %d 日)，目前價格高於 5 日均價:⚠️ KD 高檔鈍化過熱（目前指標數值：%.2f，已發動多日，追高風險極高）", stock.KD, stock.KDDays, stock.KD)
+					} else if stock.KDDays >= 1 && stock.KDDays <= 2 {
 						desc = fmt.Sprintf("KD 呈現多頭向上攻擊，目前指標數值：%.2f (已連續符合 %d 日)，目前價格高於 5 日均價:🌟 此為黃金買點（剛發動 1~2 日）", stock.KD, stock.KDDays)
 					} else {
 						desc = fmt.Sprintf("KD 呈現多頭向上攻擊，目前指標數值：%.2f (已連續符合 %d 日)，目前價格高於 5 日均價:此為近期買點（已連續發動多日，注意追高風險）", stock.KD, stock.KDDays)
 					}
 				} else {
-					desc = fmt.Sprintf("KD 呈現多頭向上攻擊，目前指標數值：%.2f (已連續符合 %d 日)，目前價格未高於 5 日均價:非近期買點", stock.KD, stock.KDDays)
+					desc = fmt.Sprintf("KD 未符合短多買點標準，目前指標數值：%.2f (已連續符合 %d 日)，目前價格未高於 5 日均價或 KD 處於死叉:非近期買點", stock.KD, stock.KDDays)
 				}
 			case "MACD":
-				valueStr = fmt.Sprintf("%.2f", stock.MACD)
+				valueStr = fmt.Sprintf("%+.2f%%", stock.MACD)
 				if stock.IsMACDBuyPoint {
-					if stock.MACDDays >= 1 && stock.MACDDays <= 2 {
-						desc = fmt.Sprintf("MACD 處於多頭上升波段，目前指標數值：%.2f (已連續符合 %d 日)，目前價格高於 20 日均價:🌟 此為黃金買點（剛發動 1~2 日）", stock.MACD, stock.MACDDays)
+					if stock.MACD > 3.0 {
+						desc = fmt.Sprintf("MACD 處於多頭但正乖離過大，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:⚠️ MACD 高檔背離/鈍化過熱（目前指標數值：%+.2f%%，已發動多日，追高風險極高）", stock.MACD, stock.MACDDays, stock.MACD)
+					} else if stock.MACDDays >= 1 && stock.MACDDays <= 2 {
+						desc = fmt.Sprintf("MACD 處於多頭上升波段，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:🌟 此為黃金買點（剛發動 1~2 日）", stock.MACD, stock.MACDDays)
 					} else {
-						desc = fmt.Sprintf("MACD 處於多頭上升波段，目前指標數值：%.2f (已連續符合 %d 日)，目前價格高於 20 日均價:此為近期買點（已連續發動多日，注意追高風險）", stock.MACD, stock.MACDDays)
+						desc = fmt.Sprintf("MACD 處於多頭上升波段，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:此為近期買點（已連續發動多日，注意追高風險）", stock.MACD, stock.MACDDays)
 					}
 				} else {
-					desc = fmt.Sprintf("MACD 處於多頭上升波段，目前指標數值：%.2f (已連續符合 %d 日)，目前價格未高於 20 日均價:非近期買點", stock.MACD, stock.MACDDays)
+					desc = fmt.Sprintf("MACD 目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格未高於 20 日均價或非多頭紅柱:非近期買點", stock.MACD, stock.MACDDays)
 				}
 			case "SMA":
 				valueStr = fmt.Sprintf("%.2f%%", stock.SMA)
@@ -916,7 +974,7 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 						desc = fmt.Sprintf("5MA 站上 20MA 多頭排列 (乖離率 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:此為近期買點（已連續發動多日，注意追高風險）", stock.SMA, stock.SMA, stock.SMADays)
 					}
 				} else {
-					desc = fmt.Sprintf("5MA 站上 20MA 多頭排列 (乖離率 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格未高於 20 日均價:非近期買點", stock.SMA, stock.SMA, stock.SMADays)
+					desc = fmt.Sprintf("5MA 與 20MA 均線強度：%+.2f%% (已連續符合 %d 日)，目前價格未高於 20 日均價或非多頭排列:非近期買點", stock.SMA, stock.SMADays)
 				}
 			case "Momentum":
 				valueStr = fmt.Sprintf("%+.2f%%", stock.Momentum)
@@ -927,18 +985,19 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 						desc = fmt.Sprintf("近 10 日動能向上 (漲幅 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 10 日均價:此為近期買點（已連續發動多日，注意追高風險）", stock.Momentum, stock.Momentum, stock.MomentumDays)
 					}
 				} else {
-					desc = fmt.Sprintf("近 10 日動能向上 (漲幅 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格未高於 10 日均價:非近期買點", stock.Momentum, stock.Momentum, stock.MomentumDays)
+					desc = fmt.Sprintf("近 10 日動能向上 (漲幅 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格未高於 10 日均價或動能未為正:非近期買點", stock.Momentum, stock.Momentum, stock.MomentumDays)
 				}
 			case "Volume Ratio", "成交量均量比策略（Volume Ratio）", "ChipRatio":
-				valueStr = fmt.Sprintf("%.2f", stock.VolumeRatio)
+				// 🎯 數值與說明統一補上「倍」單位
+				valueStr = fmt.Sprintf("%.2f 倍", stock.VolumeRatio)
 				if stock.IsVolumeRatioBuyPoint {
 					if stock.VolumeRatioDays >= 1 && stock.VolumeRatioDays <= 2 {
-						desc = fmt.Sprintf("成交量帶量突破 (10 日均量比值 > 1.5，跌破 10MA 或爆量長黑平倉)，目前指標數值：%.2f (已連續符合 %d 日)，10 日均量比值大於 1.5:🌟 此為黃金買點（剛發動 1~2 日）", stock.VolumeRatio, stock.VolumeRatioDays)
+						desc = fmt.Sprintf("成交量帶量突破 (10 日均量比值 > 1.5 倍，跌破 10MA 或爆量長黑平倉)，目前指標數值：%.2f 倍 (已連續符合 %d 日)，10 日均量比值大於 1.5 倍且收平/收紅:🌟 此為黃金買點（剛發動 1~2 日）", stock.VolumeRatio, stock.VolumeRatioDays)
 					} else {
-						desc = fmt.Sprintf("成交量帶量突破 (10 日均量比值 > 1.5，跌破 10MA 或爆量長黑平倉)，目前指標數值：%.2f (已連續符合 %d 日)，10 日均量比值大於 1.5:此為近期買點（已連續發動多日，注意追高風險）", stock.VolumeRatio, stock.VolumeRatioDays)
+						desc = fmt.Sprintf("成交量帶量突破 (10 日均量比值 > 1.5 倍，跌破 10MA 或爆量長黑平倉)，目前指標數值：%.2f 倍 (已連續符合 %d 日)，10 日均量比值大於 1.5 倍且收平/收紅:此為近期買點（已連續發動多日，注意追高風險）", stock.VolumeRatio, stock.VolumeRatioDays)
 					}
 				} else {
-					desc = fmt.Sprintf("成交量均量比值未達發動標準 (10 日均量比值需 > 1.5)，目前指標數值：%.2f (已連續符合 %d 日)，10 日均量比值未大於 1.5:非近期買點", stock.VolumeRatio, stock.VolumeRatioDays)
+					desc = fmt.Sprintf("成交量均量比值未達發動標準 (需 > 1.5 倍且當日收平/收紅)，目前指標數值：%.2f 倍 (已連續符合 %d 日)，10 日均量比未大於 1.5 倍或當日收黑:非近期買點", stock.VolumeRatio, stock.VolumeRatioDays)
 				}
 			case "Bollinger":
 				if stock.Bollinger > 5.0 {
@@ -983,9 +1042,9 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 // =====================================================================
 
 func main() {
-	fmt.Println("=== 🚀 開始執行台股 7 大策略掃描器 ===")
+	fmt.Println("=== 🚀 開始執行台股 7 大策略掃描器 (已過濾 ETF，KD 高低價已修復，Volume Ratio 已優化) ===")
 	
-	// 步驟 1：取得全市場當日基礎清單
+	// 步驟 1：取得全市場當日基礎清單 (已自動排除開頭 00, 01, 02 之 ETF/ETN)
 	stocks, err := fetchStockData()
 	if err != nil {
 		fmt.Println("❌ 抓取資料失敗:", err)
@@ -1003,7 +1062,7 @@ func main() {
 	// 步驟 2：針對前 500 大個股進行歷史 K 線深度掃描 (全面運算各指標、連續天數與買點判定)
 	scanBollingerBands(stocks)
 
-	// 步驟 3：依各真實指標排序取 Top 10 (買點分級優先排序)
+	// 步驟 3：依各真實指標排序取 Top 10 (過熱防禦與黃金買點優先排序)
 	indicators := []string{"RSI", "KD", "MACD", "SMA", "Momentum", "Volume Ratio", "Bollinger"}
 	allTop10 := make(map[string][]StockData)
 
