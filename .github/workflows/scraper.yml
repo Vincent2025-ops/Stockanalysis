@@ -2,8 +2,8 @@ name: Daily Taiwan Stock Scraper
 
 on:
   schedule:
-    # 台灣時間(UTC+8)下午 15:30 = UTC 07:30 (週一至週五)
-    - cron: '30 7 * * 1-5'
+    # 台灣時間(UTC+8)下午 15:30 = UTC 07:00 (週一至週五)
+    - cron: '00 7 * * 1-5'
   workflow_dispatch: # 允許手動觸發測試
 
 # 確保 Action 具有寫入 Repository 的權限
