@@ -8,8 +8,8 @@
 // - 歷史指標 (RSI, KD, MACD, SMA, Momentum, Volume Ratio, 布林通道) 統一採用 Yahoo Finance 真實歷史日K
 // - 🎯 KD 正統修復：納入真實盤中最高價 (High) 與最低價 (Low)，數值與專業券商 100% 精準對齊
 // - 🎯 Volume Ratio 防禦：10日均量比 > 1.5 且當日需收平/收紅，杜絕爆量長黑出貨
+// - 🎯 逆勢指標超賣排序：RSI 與布林通道在 1~2 日黃金買點內純粹依超賣深度排序，徹底解決數值跳動問題
 // - 🎯 順勢指標：發動 1~2 日且未過熱列為黃金買點，連續發動多日提示注意追高風險
-// - 🎯 逆勢指標：全面偵測超跌止跌拐點，將「超跌即將反彈」列為最高優先權，並警示破底接刀風險
 // - 🎯 防禦機制：KD > 80 與 MACD% > 3.0% 強制標註「高檔鈍化過熱」並降級處理，杜絕追高風險
 // - 🎯 嚴格超賣：RSI 門檻收緊至 35.0，杜絕非超跌股濫竽充數
 package main
@@ -524,7 +524,7 @@ func scanBollingerBands(stocks []StockData) {
 							}
 							stocks[j].VolumeRatioDays = vrDays
 
-							// 🎯 買點條件：10 日均量比值 > 1.5 且 今日股價收平或收紅 (排除主力高檔爆量長黑出貨)
+							// 買點條件：10 日均量比值 > 1.5 且 今日股價收平或收紅 (排除主力高檔爆量長黑出貨)
 							if latestVR > 1.5 && latestP >= stocks[j].PrevPrice {
 								stocks[j].IsVolumeRatioBuyPoint = true
 							} else {
@@ -654,7 +654,6 @@ func calculateAllKD(closes, highs, lows []float64, period int) ([]float64, []flo
 
 	k, d := 50.0, 50.0
 	for i := period - 1; i < n; i++ {
-		// 取出近 9 日盤中最低價與最高價視窗
 		windowLow := lows[i-period+1 : i+1]
 		windowHigh := highs[i-period+1 : i+1]
 		
@@ -744,7 +743,7 @@ func calculateRealMomentum(prices []float64, period int) float64 {
 }
 
 // =====================================================================
-// 4. 排序與匯出邏輯 (過熱防禦 + 黃金買點優先排序)
+// 4. 排序與匯出邏輯 (逆勢超賣深度優先 + 順勢過熱防禦)
 // =====================================================================
 
 // getTrendBuyPointTier 順勢指標買點分級 (2: 黃金買點 1~2 日, 1: 近期買點 >= 3 日, 0: 非買點)
@@ -786,22 +785,18 @@ func getMACDBuyPointTier(isBuy bool, days int, macdVal float64) int {
 	return 0 // 非買點
 }
 
-// getContrarianBuyPointTier 逆勢超跌指標買點分級
-// 3: 🎯 超跌反彈黃金買點 (1~2日且出現止跌/拐頭訊號，即將反彈，最高優先權)
-// 2: 超跌買點 (1~2日，醞釀反彈，次優先權)
-// 1: 超跌觀察點 (>=3日，慣性下跌中)
-// 0: 非買點
-func getContrarianBuyPointTier(isBuy bool, days int, isRebound bool) int {
+// getContrarianBuyPointTier 🎯 逆勢指標超賣買點分級 (將 1~2 日黃金買點區合併為同一優先權，內部純粹依超賣深度排序)
+// 2: 🎯 超跌黃金買點 (連續超跌 1~2 日，最佳盈虧比區間，最高優先權)
+// 1: 超跌觀察點 (連續超跌 >= 3 日，慣性下跌中)
+// 0: 非買點 (未達超賣標準 / 貼近軌道觀察)
+func getContrarianBuyPointTier(isBuy bool, days int) int {
 	if isBuy {
 		if days >= 1 && days <= 2 {
-			if isRebound {
-				return 3 // 超跌即將反彈 (最高優先權)
-			}
-			return 2 // 剛超跌 1~2 日
+			return 2 // 1~2 日統一歸為 Tier 2，不依天數拆散！
 		}
-		return 1 // 連續超跌 3 日以上
+		return 1 // 3 日以上歸為 Tier 1
 	}
-	return 0 // 非買點
+	return 0 // 非買點 (Tier 0)
 }
 
 // getTop10 依指定指標對股票進行過濾與排名，回傳前 10 名
@@ -835,11 +830,13 @@ func getTop10(stocks []StockData, indicator string) []StockData {
 	sort.Slice(candidates, func(i, j int) bool {
 		switch indicator {
 		case "RSI":
-			tierI := getContrarianBuyPointTier(candidates[i].IsRSIBuyPoint, candidates[i].RSIDays, candidates[i].IsRSIRebound)
-			tierJ := getContrarianBuyPointTier(candidates[j].IsRSIBuyPoint, candidates[j].RSIDays, candidates[j].IsRSIRebound)
+			// 🎯 逆勢超跌排序：Tier 2 (1~2日) > Tier 1 (>=3日) > Tier 0 (非買點)
+			tierI := getContrarianBuyPointTier(candidates[i].IsRSIBuyPoint, candidates[i].RSIDays)
+			tierJ := getContrarianBuyPointTier(candidates[j].IsRSIBuyPoint, candidates[j].RSIDays)
 			if tierI != tierJ {
 				return tierI > tierJ
 			}
+			// 🎯 同一等級內，不比天數，純粹依 RSI 指標值由小到大 (超賣深度越深越優先) 排序！
 			return candidates[i].RSI < candidates[j].RSI
 		case "KD":
 			tierI := getKDBuyPointTier(candidates[i].IsKDBuyPoint, candidates[i].KDDays, candidates[i].KD)
@@ -877,11 +874,13 @@ func getTop10(stocks []StockData, indicator string) []StockData {
 			}
 			return candidates[i].VolumeRatio > candidates[j].VolumeRatio
 		case "Bollinger":
-			tierI := getContrarianBuyPointTier(candidates[i].IsBollingerBuyPoint, candidates[i].BollingerDays, candidates[i].IsBollingerRebound)
-			tierJ := getContrarianBuyPointTier(candidates[j].IsBollingerBuyPoint, candidates[j].BollingerDays, candidates[j].IsBollingerRebound)
+			// 🎯 逆勢超跌排序：Tier 2 (1~2日) > Tier 1 (>=3日) > Tier 0 (非買點)
+			tierI := getContrarianBuyPointTier(candidates[i].IsBollingerBuyPoint, candidates[i].BollingerDays)
+			tierJ := getContrarianBuyPointTier(candidates[j].IsBollingerBuyPoint, candidates[j].BollingerDays)
 			if tierI != tierJ {
 				return tierI > tierJ
 			}
+			// 🎯 同一等級內，不比天數，純粹依布林下軌乖離率由小到大 (負乖離越深越優先) 排序！
 			return candidates[i].Bollinger < candidates[j].Bollinger
 		}
 		return false
@@ -988,7 +987,6 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 					desc = fmt.Sprintf("近 10 日動能向上 (漲幅 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格未高於 10 日均價或動能未為正:非近期買點", stock.Momentum, stock.Momentum, stock.MomentumDays)
 				}
 			case "Volume Ratio", "成交量均量比策略（Volume Ratio）", "ChipRatio":
-				// 🎯 數值與說明統一補上「倍」單位
 				valueStr = fmt.Sprintf("%.2f 倍", stock.VolumeRatio)
 				if stock.IsVolumeRatioBuyPoint {
 					if stock.VolumeRatioDays >= 1 && stock.VolumeRatioDays <= 2 {
@@ -1042,7 +1040,7 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 // =====================================================================
 
 func main() {
-	fmt.Println("=== 🚀 開始執行台股 7 大策略掃描器 (已過濾 ETF，KD 高低價已修復，Volume Ratio 已優化) ===")
+	fmt.Println("=== 🚀 開始執行台股 7 大策略掃描器 (已過濾 ETF，KD 高低價已修復，逆勢超賣深度排序已優化) ===")
 	
 	// 步驟 1：取得全市場當日基礎清單 (已自動排除開頭 00, 01, 02 之 ETF/ETN)
 	stocks, err := fetchStockData()
