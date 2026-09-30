@@ -8,8 +8,7 @@
 // - 歷史指標 (RSI, KD, MACD, SMA, Momentum, Volume Ratio, 布林通道) 統一採用 Yahoo Finance 真實歷史日K
 // - 🎯 KD 正統修復：納入真實盤中最高價 (High) 與最低價 (Low)，數值與專業券商 100% 精準對齊
 // - 🎯 Volume Ratio 防禦：10日均量比 > 1.5 且當日需收平/收紅，杜絕爆量長黑出貨
-// - 🎯 逆勢指標超賣排序：RSI 與布林通道在 1~2 日黃金買點內純粹依超賣深度排序，徹底解決數值跳動問題
-// - 🎯 順勢指標：發動 1~2 日且未過熱列為黃金買點，連續發動多日提示注意追高風險
+// - 🎯 順勢指標精準排序：嚴格區分「首日發動」與「次日發動」，首日買點為最高優先權，次日居次。
 // - 🎯 防禦機制：KD > 80 與 MACD% > 3.0% 強制標註「高檔鈍化過熱」並降級處理，杜絕追高風險
 // - 🎯 嚴格超賣：RSI 門檻收緊至 35.0，杜絕非超跌股濫竽充數
 package main
@@ -743,14 +742,16 @@ func calculateRealMomentum(prices []float64, period int) float64 {
 }
 
 // =====================================================================
-// 4. 排序與匯出邏輯 (逆勢超賣深度優先 + 順勢過熱防禦)
+// 4. 排序與匯出邏輯 (逆勢超賣深度優先 + 順勢首日發動優先防禦)
 // =====================================================================
 
-// getTrendBuyPointTier 順勢指標買點分級 (2: 黃金買點 1~2 日, 1: 近期買點 >= 3 日, 0: 非買點)
+// getTrendBuyPointTier 順勢指標買點分級 (3: 首日發動, 2: 次日發動, 1: 近期買點 >= 3 日, 0: 非買點)
 func getTrendBuyPointTier(isBuy bool, days int) int {
 	if isBuy {
-		if days >= 1 && days <= 2 {
-			return 2 // 🎯 黃金買點：剛發動 1~2 日 (最高優先權)
+		if days == 1 {
+			return 3 // 🎯 首日黃金買點 (最高優先權)
+		} else if days == 2 {
+			return 2 // 🎯 次日黃金買點
 		}
 		return 1 // 近期買點：連續符合 3 日以上
 	}
@@ -763,8 +764,10 @@ func getKDBuyPointTier(isBuy bool, days int, kVal float64) int {
 		if kVal > 80.0 {
 			return 1 // 降級為過熱觀察，不得列為黃金買點
 		}
-		if days >= 1 && days <= 2 {
-			return 3 // 🎯 黃金買點：健康區間剛發動 1~2 日 (最高優先權)
+		if days == 1 {
+			return 4 // 🎯 首日黃金買點 (最高優先權)
+		} else if days == 2 {
+			return 3 // 🎯 次日黃金買點
 		}
 		return 2 // 近期買點：連續符合 3 日以上但未過熱
 	}
@@ -777,8 +780,10 @@ func getMACDBuyPointTier(isBuy bool, days int, macdVal float64) int {
 		if macdVal > 3.0 {
 			return 1 // 降級為高檔鈍化過熱，不得列為黃金買點
 		}
-		if days >= 1 && days <= 2 {
-			return 3 // 🎯 黃金買點：健康區間剛翻紅發動 1~2 日 (最高優先權)
+		if days == 1 {
+			return 4 // 🎯 首日黃金買點 (最高優先權)
+		} else if days == 2 {
+			return 3 // 🎯 次日黃金買點
 		}
 		return 2 // 近期買點：連續符合 3 日以上但未過熱
 	}
@@ -792,7 +797,7 @@ func getMACDBuyPointTier(isBuy bool, days int, macdVal float64) int {
 func getContrarianBuyPointTier(isBuy bool, days int) int {
 	if isBuy {
 		if days >= 1 && days <= 2 {
-			return 2 // 1~2 日統一歸為 Tier 2，不依天數拆散！
+			return 2 // 1~2 日統一歸為 Tier 2，逆勢指標以深度為主！
 		}
 		return 1 // 3 日以上歸為 Tier 1
 	}
@@ -940,24 +945,29 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 				}
 			case "KD":
 				valueStr = fmt.Sprintf("%.2f", stock.KD)
+				rulePrefix := "買賣規則: KD呈現多頭攻擊且站上5MA買進，KD>80過熱注意風險。"
 				if stock.IsKDBuyPoint {
 					if stock.KD > 80.0 {
-						desc = fmt.Sprintf("KD 呈現多頭但進入極端超買區，目前指標數值：%.2f (已連續符合 %d 日)，目前價格高於 5 日均價:⚠️ KD 高檔鈍化過熱（目前指標數值：%.2f，已發動多日，追高風險極高）", stock.KD, stock.KDDays, stock.KD)
-					} else if stock.KDDays >= 1 && stock.KDDays <= 2 {
-						desc = fmt.Sprintf("KD 呈現多頭向上攻擊，目前指標數值：%.2f (已連續符合 %d 日)，目前價格高於 5 日均價:🌟 此為黃金買點（剛發動 1~2 日）", stock.KD, stock.KDDays)
+						desc = fmt.Sprintf("%s ⚠️ KD 高檔鈍化過熱（目前指標數值：%.2f，已連續發動 %d 日，追高風險極高）", rulePrefix, stock.KD, stock.KDDays)
+					} else if stock.KDDays == 1 {
+						desc = fmt.Sprintf("%s 🌟 此為首日黃金買點（剛發動第 1 日，目前指標數值：%.2f）", rulePrefix, stock.KD)
+					} else if stock.KDDays == 2 {
+						desc = fmt.Sprintf("%s 🌟 此為次日黃金買點（剛發動第 2 日，目前指標數值：%.2f）", rulePrefix, stock.KD)
 					} else {
-						desc = fmt.Sprintf("KD 呈現多頭向上攻擊，目前指標數值：%.2f (已連續符合 %d 日)，目前價格高於 5 日均價:此為近期買點（已連續發動多日，注意追高風險）", stock.KD, stock.KDDays)
+						desc = fmt.Sprintf("%s 此為近期買點（已連續發動 %d 日，注意追高風險，目前指標數值：%.2f）", rulePrefix, stock.KDDays, stock.KD)
 					}
 				} else {
-					desc = fmt.Sprintf("KD 未符合短多買點標準，目前指標數值：%.2f (已連續符合 %d 日)，目前價格未高於 5 日均價或 KD 處於死叉:非近期買點", stock.KD, stock.KDDays)
+					desc = fmt.Sprintf("%s 非近期買點（目前指標數值：%.2f，未符合短多買點標準）", rulePrefix, stock.KD)
 				}
 			case "MACD":
 				valueStr = fmt.Sprintf("%+.2f%%", stock.MACD)
 				if stock.IsMACDBuyPoint {
 					if stock.MACD > 3.0 {
 						desc = fmt.Sprintf("MACD 處於多頭但正乖離過大，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:⚠️ MACD 高檔背離/鈍化過熱（目前指標數值：%+.2f%%，已發動多日，追高風險極高）", stock.MACD, stock.MACDDays, stock.MACD)
-					} else if stock.MACDDays >= 1 && stock.MACDDays <= 2 {
-						desc = fmt.Sprintf("MACD 處於多頭上升波段，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:🌟 此為黃金買點（剛發動 1~2 日）", stock.MACD, stock.MACDDays)
+					} else if stock.MACDDays == 1 {
+						desc = fmt.Sprintf("MACD 處於多頭上升波段，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:🌟 此為首日黃金買點（剛發動第 1 日）", stock.MACD, stock.MACDDays)
+					} else if stock.MACDDays == 2 {
+						desc = fmt.Sprintf("MACD 處於多頭上升波段，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:🌟 此為次日黃金買點（剛發動第 2 日）", stock.MACD, stock.MACDDays)
 					} else {
 						desc = fmt.Sprintf("MACD 處於多頭上升波段，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:此為近期買點（已連續發動多日，注意追高風險）", stock.MACD, stock.MACDDays)
 					}
@@ -967,8 +977,10 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 			case "SMA":
 				valueStr = fmt.Sprintf("%.2f%%", stock.SMA)
 				if stock.IsSMABuyPoint {
-					if stock.SMADays >= 1 && stock.SMADays <= 2 {
-						desc = fmt.Sprintf("5MA 站上 20MA 多頭排列 (乖離率 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:🌟 此為黃金買點（剛發動 1~2 日）", stock.SMA, stock.SMA, stock.SMADays)
+					if stock.SMADays == 1 {
+						desc = fmt.Sprintf("5MA 站上 20MA 多頭排列 (乖離率 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:🌟 此為首日黃金買點（剛發動第 1 日）", stock.SMA, stock.SMA, stock.SMADays)
+					} else if stock.SMADays == 2 {
+						desc = fmt.Sprintf("5MA 站上 20MA 多頭排列 (乖離率 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:🌟 此為次日黃金買點（剛發動第 2 日）", stock.SMA, stock.SMA, stock.SMADays)
 					} else {
 						desc = fmt.Sprintf("5MA 站上 20MA 多頭排列 (乖離率 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 20 日均價:此為近期買點（已連續發動多日，注意追高風險）", stock.SMA, stock.SMA, stock.SMADays)
 					}
@@ -978,8 +990,10 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 			case "Momentum":
 				valueStr = fmt.Sprintf("%+.2f%%", stock.Momentum)
 				if stock.IsMomentumBuyPoint {
-					if stock.MomentumDays >= 1 && stock.MomentumDays <= 2 {
-						desc = fmt.Sprintf("近 10 日動能強勁 (漲幅 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 10 日均價:🌟 此為黃金買點（剛發動 1~2 日）", stock.Momentum, stock.Momentum, stock.MomentumDays)
+					if stock.MomentumDays == 1 {
+						desc = fmt.Sprintf("近 10 日動能強勁 (漲幅 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 10 日均價:🌟 此為首日黃金買點（剛發動第 1 日）", stock.Momentum, stock.Momentum, stock.MomentumDays)
+					} else if stock.MomentumDays == 2 {
+						desc = fmt.Sprintf("近 10 日動能強勁 (漲幅 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 10 日均價:🌟 此為次日黃金買點（剛發動第 2 日）", stock.Momentum, stock.Momentum, stock.MomentumDays)
 					} else {
 						desc = fmt.Sprintf("近 10 日動能向上 (漲幅 %+.2f%%)，目前指標數值：%+.2f%% (已連續符合 %d 日)，目前價格高於 10 日均價:此為近期買點（已連續發動多日，注意追高風險）", stock.Momentum, stock.Momentum, stock.MomentumDays)
 					}
@@ -989,8 +1003,10 @@ func exportToCSV(fileName string, allTop10 map[string][]StockData) error {
 			case "Volume Ratio", "成交量均量比策略（Volume Ratio）", "ChipRatio":
 				valueStr = fmt.Sprintf("%.2f 倍", stock.VolumeRatio)
 				if stock.IsVolumeRatioBuyPoint {
-					if stock.VolumeRatioDays >= 1 && stock.VolumeRatioDays <= 2 {
-						desc = fmt.Sprintf("成交量帶量突破 (10 日均量比值 > 1.5 倍，跌破 10MA 或爆量長黑平倉)，目前指標數值：%.2f 倍 (已連續符合 %d 日)，10 日均量比值大於 1.5 倍且收平/收紅:🌟 此為黃金買點（剛發動 1~2 日）", stock.VolumeRatio, stock.VolumeRatioDays)
+					if stock.VolumeRatioDays == 1 {
+						desc = fmt.Sprintf("成交量帶量突破 (10 日均量比值 > 1.5 倍，跌破 10MA 或爆量長黑平倉)，目前指標數值：%.2f 倍 (已連續符合 %d 日)，10 日均量比值大於 1.5 倍且收平/收紅:🌟 此為首日黃金買點（剛發動第 1 日）", stock.VolumeRatio, stock.VolumeRatioDays)
+					} else if stock.VolumeRatioDays == 2 {
+						desc = fmt.Sprintf("成交量帶量突破 (10 日均量比值 > 1.5 倍，跌破 10MA 或爆量長黑平倉)，目前指標數值：%.2f 倍 (已連續符合 %d 日)，10 日均量比值大於 1.5 倍且收平/收紅:🌟 此為次日黃金買點（剛發動第 2 日）", stock.VolumeRatio, stock.VolumeRatioDays)
 					} else {
 						desc = fmt.Sprintf("成交量帶量突破 (10 日均量比值 > 1.5 倍，跌破 10MA 或爆量長黑平倉)，目前指標數值：%.2f 倍 (已連續符合 %d 日)，10 日均量比值大於 1.5 倍且收平/收紅:此為近期買點（已連續發動多日，注意追高風險）", stock.VolumeRatio, stock.VolumeRatioDays)
 					}
