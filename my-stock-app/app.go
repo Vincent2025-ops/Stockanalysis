@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"          // 新增：處理底層 TCP/IPv4 連線
 	"net/http"
+	"net/url"      // 新增：處理 Proxy 網址解析
 	"os"
 	"regexp"
 	"sort"
@@ -103,20 +105,29 @@ func (a *App) ForceDownloadTDCC() {
 // 🎯 核心強化：全域防封鎖與重試 HTTP 請求函數
 // =========================================================
 
-func httpGetWithRetry(url string) (*http.Response, error) {
+func httpGetWithRetry(urlStr string) (*http.Response, error) {
 	customTransport := &http.Transport{
+		// 1. 強制回傳 nil，完全忽略任何 Windows 系統或環境變數的 Proxy 設定
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			return nil, nil
+		},
+		// 2. 強制使用 IPv4 (tcp4)，避免 ISP 的 IPv6 路由中斷導致秒殺
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return net.DialTimeout("tcp4", addr, 5*time.Second)
+		},
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 		ForceAttemptHTTP2: false,
 		DisableKeepAlives: true,
 	}
 
 	client := &http.Client{
-		Timeout:   4 * time.Second,
+		Timeout:   10 * time.Second, // 放寬單次請求超時限制為 10 秒
 		Transport: customTransport,
 	}
 
-	for i := 0; i < 2; i++ {
-		req, _ := http.NewRequest("GET", url, nil)
+	var lastErr error
+	for i := 0; i < 3; i++ { // 放寬重試次數為 3 次
+		req, _ := http.NewRequest("GET", urlStr, nil)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
 		req.Header.Set("Accept-Language", "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7")
@@ -128,10 +139,19 @@ func httpGetWithRetry(url string) (*http.Response, error) {
 			return resp, nil 
 		}
 		
-		if resp != nil { resp.Body.Close() }
-		time.Sleep(300 * time.Millisecond)
+		// 除錯機制：將底層真實的網路報錯印在執行視窗上
+		if err != nil {
+			lastErr = err
+			fmt.Printf("[HTTP 請求失敗] 第 %d 次連線錯誤: %v\n", i+1, err)
+		} else if resp != nil {
+			lastErr = fmt.Errorf("狀態碼錯誤: %d", resp.StatusCode)
+			fmt.Printf("[HTTP 請求失敗] 第 %d 次狀態碼異常: %d\n", i+1, resp.StatusCode)
+			resp.Body.Close()
+		}
+		
+		time.Sleep(1 * time.Second) // 若失敗，暫停 1 秒再重試
 	}
-	return nil, fmt.Errorf("HTTP 請求失敗，已達最大重試次數")
+	return nil, fmt.Errorf("HTTP 請求失敗，已達最大重試次數。最後錯誤: %v", lastErr)
 }
 
 func parseFinancialNumber(s string) (float64, error) {
@@ -479,7 +499,7 @@ func getIndicatorRule(ind string) string {
 	case "RSI":
 		return "RSI<30 買進，RSI>70 賣出"
 	case "KD":
-		return "KD<20 買進，KD>80 賣出"
+		return "KD呈現多頭攻擊且站上5MA買進，KD>80過熱注意風險。"
 	case "MACD":
 		return "MACD柱狀圖負轉正(黃金交叉)買進，正轉負(死亡交叉)賣出"
 	case "SMA":
@@ -643,7 +663,7 @@ func (a *App) FetchTop10FromCloud() ([]Top10Stock, error) {
 			if desc == "" {
 				switch indicator {
 				case "RSI": desc = "RSI 處於極低檔，具有極高超賣反彈爆發潛力"
-				case "KD": desc = "KD 處於低檔超賣區，具備低檔黃金交叉佈局契機"
+				case "KD": desc = "KD 呈現多頭向上攻擊，強勢站上 5 日均線"
 				case "MACD": desc = "MACD 柱狀圖動能強勁，處於多頭強勢上升趨勢"
 				case "SMA": desc = "股價強勢突破均線表態，技術面全面轉強"
 				case "BollingerBands", "Bollinger Bands", "Bollinger": desc = "股價觸及布林通道下軌，具備潛在的反彈與回歸均值動能"
@@ -658,8 +678,9 @@ func (a *App) FetchTop10FromCloud() ([]Top10Stock, error) {
 				indicator = "VolumeRatio"
 			}
 
+			// 🎯 更新正則表達式，適配新版文案 (如: "剛發動第 1 日", "連續發動 3 日")
 			days := 999
-			reDays := regexp.MustCompile(`(?:已)?連續(?:符合)?\s*(\d+)\s*日`)
+			reDays := regexp.MustCompile(`(?:連續符合|連續發動|剛發動第)\s*(\d+)\s*日`)
 			if match := reDays.FindStringSubmatch(desc); len(match) > 1 {
 				if d, err := strconv.Atoi(match[1]); err == nil && d > 0 {
 					days = d
@@ -680,7 +701,8 @@ func (a *App) FetchTop10FromCloud() ([]Top10Stock, error) {
 			metricText = strings.ReplaceAll(metricText, "目前指標數值", "指標數值")
 
 			if days < 999 {
-				reDaysStr := regexp.MustCompile(`(?:已)?連續(?:符合)?\s*\d+\s*日`)
+				// 🎯 同步更新字串萃取的正則
+				reDaysStr := regexp.MustCompile(`(?:已)?(?:連續符合|連續發動|剛發動第)\s*\d+\s*日`)
 				if dStr := reDaysStr.FindString(desc); dStr != "" {
 					daysText = strings.TrimSpace(dStr)
 				} else {
@@ -720,15 +742,8 @@ func (a *App) FetchTop10FromCloud() ([]Top10Stock, error) {
 		stocks, ok := grouped[ind]
 		if !ok || len(stocks) == 0 { continue }
 		
-		sort.Slice(stocks, func(i, j int) bool {
-			if stocks[i].Days != stocks[j].Days {
-				return stocks[i].Days < stocks[j].Days
-			}
-			if ind == "RSI" || ind == "KD" || strings.Contains(ind, "Bollinger") { 
-				return stocks[i].Value < stocks[j].Value 
-			}
-			return stocks[i].Value > stocks[j].Value 
-		})
+		// 🎯 移除前端強制重排，100% 信任後端 CSV 已經精心計算好的順序！
+		// 這保證了所有「第 1 日」、「第 2 日」以及「逆勢深度」的策略能完美呈現
 		
 		limit := 10
 		if len(stocks) < limit { limit = len(stocks) }
@@ -1042,9 +1057,72 @@ func (a *App) FetchNBreakout() ([]Top10Stock, error) {
 
 			feature := fmt.Sprintf("【%s】%s%s，守穩支撐待突破", indDesc, prodDesc, statusDesc)
 
+			// 🎯 修正：Yahoo 歷史 K 線陣列在盤後或某些時段，可能尚未即時更新今日最新資料（導致依賴歷史陣列計算時抓到舊資料而全部顯示正數）。
+			// 針對篩選出的少數目標標的，額外呼叫最即時的 Quote API 獲取絕對準確的收盤價與即時漲跌幅。
+			actualPrice := todayClose
+			actualChangeVal := todayClose - closes[n-2]
+
+			// 重用系統原本的 Yahoo 憑證狀態
+			yahooAuthMu.Lock()
+			crumb := yahooCrumb
+			cookie := yahooCookie
+			yahooAuthMu.Unlock()
+
+			quoteUrl := fmt.Sprintf("https://query1.finance.yahoo.com/v7/finance/quote?symbols=%s.TW,%s.TWO", cand.ID, cand.ID)
+			if crumb != "" {
+				quoteUrl += "&crumb=" + crumb
+			}
+			
+			reqQ, _ := http.NewRequest("GET", quoteUrl, nil)
+			reqQ.Header.Set("User-Agent", "Mozilla/5.0")
+			if cookie != "" {
+				reqQ.Header.Set("Cookie", cookie)
+			}
+			
+			clientQ := &http.Client{Timeout: 4 * time.Second}
+			if respQ, errQ := clientQ.Do(reqQ); errQ == nil && respQ.StatusCode == 200 {
+				var res map[string]interface{}
+				if json.NewDecoder(respQ.Body).Decode(&res) == nil {
+					if qr, ok := res["quoteResponse"].(map[string]interface{}); ok {
+						if results, ok := qr["result"].([]interface{}); ok && len(results) > 0 {
+							if data, ok := results[0].(map[string]interface{}); ok {
+								if rPrice, ok := data["regularMarketPrice"].(float64); ok && rPrice > 0 {
+									actualPrice = rPrice
+								}
+								if rChange, ok := data["regularMarketChange"].(float64); ok {
+									actualChangeVal = rChange // 優先直接取得 API 算好的即時精準漲跌價差
+								} else if pClose, ok := data["regularMarketPreviousClose"].(float64); ok && pClose > 0 {
+									actualChangeVal = actualPrice - pClose // 備用：若無 change 欄位，用即時價格減昨收
+								}
+							}
+						}
+					}
+				}
+				respQ.Body.Close()
+			} else if respQ != nil {
+				respQ.Body.Close()
+			}
+
+			// 解決浮點數精準度問題（如避免將 -0.001 判定為負數或產生過多小數）
+			actualChangeVal = math.Round(actualChangeVal*100) / 100
+
+			var actualChangeStr string
+			if actualChangeVal > 0 {
+				actualChangeStr = fmt.Sprintf("+%.2f", actualChangeVal)
+			} else if actualChangeVal < 0 {
+				actualChangeStr = fmt.Sprintf("%.2f", actualChangeVal) // 負數自帶負號，不需額外加號
+			} else {
+				actualChangeStr = "0.00" // 完全平盤
+			}
+
 			mu.Lock()
 			breakoutStocks = append(breakoutStocks, nBreakoutResult{
-				StockID: cand.ID, Name: cand.Name, Price: cand.Price, Change: cand.Change, Score: score, Feature: feature,
+				StockID: cand.ID, 
+				Name:    cand.Name, 
+				Price:   actualPrice,     
+				Change:  actualChangeStr, 
+				Score:   score, 
+				Feature: feature,
 			})
 			mu.Unlock()
 
@@ -1192,8 +1270,8 @@ func fetchQuarterlyEPS(stockID string) ([]string, []float64, error) {
 	}
 
 	for _, mirror := range mirrors {
-		url := fmt.Sprintf("https://%s/z/zc/zcq/zcq_%s.djhtm", mirror, stockID)
-		resp, err := httpGetWithRetry(url)
+		urlStr := fmt.Sprintf("https://%s/z/zc/zcq/zcq_%s.djhtm", mirror, stockID)
+		resp, err := httpGetWithRetry(urlStr)
 		if err != nil { continue }
 		
 		reader := transform.NewReader(resp.Body, traditionalchinese.Big5.NewDecoder())
@@ -1893,9 +1971,9 @@ func (a *App) DownloadStockHistory(input string) (string, error) {
 	totalRecords := 0
 	for i := 11; i >= 0; i-- { 
 		targetMonth := now.AddDate(0, -i, 0).Format("20060102")
-		url := fmt.Sprintf("https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date=%s&stockNo=%s", targetMonth, stockID)
+		urlStr := fmt.Sprintf("https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date=%s&stockNo=%s", targetMonth, stockID)
 		
-		resp, err := httpGetWithRetry(url)
+		resp, err := httpGetWithRetry(urlStr)
 		if err == nil {
 			var result map[string]interface{}
 			json.NewDecoder(resp.Body).Decode(&result)
@@ -2125,8 +2203,8 @@ func fetchInstitutional(stockID, currentDate string) (int, int, int, int) {
 			mu.Unlock()
 			if isFound { return }
 
-			url := fmt.Sprintf("https://www.twse.com.tw/fund/T86?response=json&date=%s&selectType=ALL", date)
-			resp, err := httpGetWithRetry(url)
+			urlStr := fmt.Sprintf("https://www.twse.com.tw/fund/T86?response=json&date=%s&selectType=ALL", date)
+			resp, err := httpGetWithRetry(urlStr)
 			if err == nil {
 				var result map[string]interface{}
 				json.NewDecoder(resp.Body).Decode(&result)
@@ -2237,8 +2315,8 @@ func fetchDayTradingForStock(stockID, currentDate string) float64 {
 			mu.Unlock()
 			if isFound { return }
 
-			url := fmt.Sprintf("https://www.twse.com.tw/exchangeReport/TWTB4U?response=csv&date=%s", date)
-			resp, err := httpGetWithRetry(url)
+			urlStr := fmt.Sprintf("https://www.twse.com.tw/exchangeReport/TWTB4U?response=csv&date=%s", date)
+			resp, err := httpGetWithRetry(urlStr)
 			if err == nil {
 				utf8Reader := transform.NewReader(resp.Body, traditionalchinese.Big5.NewDecoder())
 				utf8Data, _ := io.ReadAll(utf8Reader)
@@ -2354,8 +2432,8 @@ func fetchDailyTotalVolume(stockID, currentDate string) float64 {
 	}
 
 	queryMonth := currentDate[:6] + "01"
-	url := fmt.Sprintf("https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date=%s&stockNo=%s", queryMonth, stockID)
-	resp, err := httpGetWithRetry(url)
+	urlStr = fmt.Sprintf("https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date=%s&stockNo=%s", queryMonth, stockID)
+	resp, err := httpGetWithRetry(urlStr)
 	if err == nil {
 		defer resp.Body.Close()
 		var result map[string]interface{}
@@ -2531,8 +2609,8 @@ func fetchAdvancedMarginData(stockID, currentDate string) (MarginDetail, error) 
 			mu.Unlock()
 			if isFound { return }
 
-			url := fmt.Sprintf("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date=%s&selectType=ALL&response=csv", date)
-			resp, err := httpGetWithRetry(url)
+			urlStr := fmt.Sprintf("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date=%s&selectType=ALL&response=csv", date)
+			resp, err := httpGetWithRetry(urlStr)
 			if err == nil {
 				utf8Reader := transform.NewReader(resp.Body, traditionalchinese.Big5.NewDecoder())
 				utf8Data, _ := io.ReadAll(utf8Reader)
@@ -2730,7 +2808,7 @@ func fetchAdvancedMarginData(stockID, currentDate string) (MarginDetail, error) 
 								} else if int(detail.SqueezeForce) > -10 {
 									detail.SqueezeEval = "📉 -10~-5，空方力量增強，股價可能承壓"
 								} else {
-									detail.SqueezeEval = "⚠️ <-10，市場空方動能強，可能發生多殺多風險！"
+									detail.SqueezeEval = "⚠ <-10，市場空方動能強，可能發生多殺多風險！"
 								}
 								
 								if detail.ShortSqueezeStr >= 100 {
@@ -2785,8 +2863,8 @@ func fetchLargeShareholders(stockID string) (float64, float64, bool) {
 		go func(mirror string) {
 			defer wg.Done()
 			
-			url := fmt.Sprintf("https://%s/z/zc/zcj/zcj_%s.djhtm", mirror, stockID)
-			resp, err := httpGetWithRetry(url)
+			urlStr := fmt.Sprintf("https://%s/z/zc/zcj/zcj_%s.djhtm", mirror, stockID)
+			resp, err := httpGetWithRetry(urlStr)
 			if err != nil { return }
 			defer resp.Body.Close()
 
@@ -2821,8 +2899,8 @@ func fetchLargeShareholders(stockID string) (float64, float64, bool) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		url := fmt.Sprintf("https://histock.tw/stock/large.aspx?no=%s", stockID)
-		resp, err := httpGetWithRetry(url)
+		urlStr := fmt.Sprintf("https://histock.tw/stock/large.aspx?no=%s", stockID)
+		resp, err := httpGetWithRetry(urlStr)
 		if err != nil { return }
 		defer resp.Body.Close()
 		
@@ -2857,8 +2935,8 @@ func fetchLargeShareholders(stockID string) (float64, float64, bool) {
 	go func() {
 		defer wg.Done()
 		startDate := time.Now().AddDate(0, -6, 0).Format("2006-01-02")
-		url := fmt.Sprintf("https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockHoldingSharesPer&data_id=%s&start_date=%s", stockID, startDate)
-		resp, err := httpGetWithRetry(url)
+		urlStr := fmt.Sprintf("https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockHoldingSharesPer&data_id=%s&start_date=%s", stockID, startDate)
+		resp, err := httpGetWithRetry(urlStr)
 		if err != nil { return }
 		defer resp.Body.Close()
 		
